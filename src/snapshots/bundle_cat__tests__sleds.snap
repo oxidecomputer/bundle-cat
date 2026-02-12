@@ -1,0 +1,11 @@
+---
+source: bundle-cat/src/main.rs
+expression: "String::from_utf8_lossy(&out)"
+---
+CUBBY	SERIAL     	ID                                  	SCRIMLET
+ 8	BRM03250017	f589c739-3c4c-4731-8f6f-41c8b2e72f89	   false
+14	BRM03250013	690650fd-4f95-4b3a-b2ec-977d47154383	    true
+
+UNHEALTHY SLEDS
+CUBBY	SERIAL
+13	BRM03250666

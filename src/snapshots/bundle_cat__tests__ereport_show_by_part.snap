@@ -1,0 +1,28 @@
+---
+source: bundle-cat/src/main.rs
+expression: "String::from_utf8_lossy(&part_out)"
+---
+==> ereports/907-0000023-BRM03250000/550e8400-e29b-41d4-a716-446655440000/305419896.json <==
+{
+  "class": "ereport.io.pci.device",
+  "collector_id": "7c3a8b90-f234-4567-89ab-cdef01234567",
+  "details": {
+    "device_id": "0x1234",
+    "vendor_id": "0x8086"
+  },
+  "ena": "0x0000000012345678",
+  "fault_class": "fault.io.pci.device.error",
+  "part_number": "907-0000023",
+  "reporter": {
+    "Sp": {
+      "slot": 5,
+      "sp_type": "Sled"
+    }
+  },
+  "restart_id": "550e8400-e29b-41d4-a716-446655440000",
+  "serial_number": "BRM03250000",
+  "severity": "major",
+  "time_collected": "2025-10-11T14:32:15.123Z",
+  "time_deleted": null,
+  "timestamp": 12345
+}

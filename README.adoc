@@ -1,0 +1,81 @@
+= bundle-cat
+
+A small tool to find and print files from support bundles.
+
+== Usage
+
+List sleds in the bundle:
+
+[source]
+----
+$ bundle-cat bundle_2025-09-24_10-30.zip sleds
+SERIAL     	ID
+BRM03250047	0f16e501-0b41-4b14-aa24-a81b791d71fb
+BRM03250027	282dd3a4-dbd3-4bc6-9715-350be2328816
+...
+----
+
+List zones in the bundle, optionally filtering by sled serial or id:
+
+[source]
+----
+$ bundle-cat bundle_2025-09-24_10-30.zip zones --sleds BRM03250047
+global
+oxz_crucible_2199a890-b984-4f69-aba9-b0193c038772
+...
+----
+
+List all files with names ending in '.json':
+
+[source]
+----
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --sleds BRM03250047 --paths '*.json' --list
+rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/0f16e501-0b41-4b14-aa24-a81b791d71fb/dladm.json
+rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/0f16e501-0b41-4b14-aa24-a81b791d71fb/health-check.json
+...
+----
+
+List all log files for the `dendrite` service:
+
+[source]
+----
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --services 'dendri*' --list
+rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758688200
+rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758691800
+...
+----
+
+Print the first five lines of the matching files:
+
+[source]
+----
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --services 'dendri*' --head
+==> rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758688200 <==
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.395830378Z","hostname":"oxz_switch","pid":1717,"uri":"/ndp","method":"GET","req_id":"edcc74ae-0f62-4575-a9e1-71fd9c8b071a","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":164,"response_code":"200"}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.460727138Z","hostname":"oxz_switch","pid":1717,"uri":"/ndp?page_token=eyJ2IjoidjEiLCJwYWdlX3N0YXJ0Ijp7ImlwIjoiZmU4MDo6YWE0MDoyNWZmOmZlMDU6M2EyMiJ9fQ%3D%3D","method":"GET","req_id":"849734a9-5595-49bd-95d2-02024e4f767a","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":79,"response_code":"200"}
+{"msg":"reporting modules as present to SDE","v":0,"name":"dpd","level":20,"time":"2025-09-24T03:30:01.593367949Z","hostname":"oxz_switch","pid":1717,"qsfp":"0x00000101","backplane":"0xffffffff"}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.949284122Z","hostname":"oxz_switch","pid":1717,"uri":"/arp","method":"GET","req_id":"ca1619e1-1dc9-4a06-b5b9-80c4d5eb964f","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":92,"response_code":"200"}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.949706948Z","hostname":"oxz_switch","pid":1717,"uri":"/arp?page_token=eyJ2IjoidjEiLCJwYWdlX3N0YXJ0Ijp7ImlwIjoiNy4yNDcuMjI5LjEyOSJ9fQ%3D%3D","method":"GET","req_id":"0414bdfc-68d2-4547-972c-56cc12c67c0d","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":91,"response_code":"200"}
+
+==> rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758691800 <==
+{"msg":"loopback entry fd69:644c:516f:ee88::1 already set","v":0,"name":"dpd","level":20,"time":"2025-09-24T04:30:01.566208274Z","hostname":"oxz_switch","pid":1717}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T04:30:01.566303055Z","hostname":"oxz_switch","pid":1717,"uri":"/loopback/ipv6","method":"POST","req_id":"4a7adc54-1686-468f-9a1c-97cd10a29d7b","remote_addr":"[::1]:52186","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":90,"response_code":"204"}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T04:30:01.566521742Z","hostname":"oxz_switch","pid":1717,"uri":"/route/ipv4/0.0.0.0%2F0","method":"GET","req_id":"f0227062-e253-452e-ba10-3b1b738cc01f","remote_addr":"[::1]:52186","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":71,"response_code":"200"}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T04:30:01.567230924Z","hostname":"oxz_switch","pid":1717,"uri":"/ports/qsfp0/links/0","method":"GET","req_id":"d9bc02ff-af76-4744-a399-b38de43d18cc","remote_addr":"[::1]:52186","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":76,"response_code":"200"}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T04:30:01.567533401Z","hostname":"oxz_switch","pid":1717,"uri":"/links","method":"GET","req_id":"39aae3f3-7952-49aa-bccc-49bd27a15b51","remote_addr":"[::1]:52186","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":98,"response_code":"200"}
+...
+----
+
+Print the full contents of all matching files:
+
+[source]
+----
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --services 'dendri*'
+==> rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758688200 <==
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.395830378Z","hostname":"oxz_switch","pid":1717,"uri":"/ndp","method":"GET","req_id":"edcc74ae-0f62-4575-a9e1-71fd9c8b071a","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":164,"response_code":"200"}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.460727138Z","hostname":"oxz_switch","pid":1717,"uri":"/ndp?page_token=eyJ2IjoidjEiLCJwYWdlX3N0YXJ0Ijp7ImlwIjoiZmU4MDo6YWE0MDoyNWZmOmZlMDU6M2EyMiJ9fQ%3D%3D","method":"GET","req_id":"849734a9-5595-49bd-95d2-02024e4f767a","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":79,"response_code":"200"}
+{"msg":"reporting modules as present to SDE","v":0,"name":"dpd","level":20,"time":"2025-09-24T03:30:01.593367949Z","hostname":"oxz_switch","pid":1717,"qsfp":"0x00000101","backplane":"0xffffffff"}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.949284122Z","hostname":"oxz_switch","pid":1717,"uri":"/arp","method":"GET","req_id":"ca1619e1-1dc9-4a06-b5b9-80c4d5eb964f","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":92,"response_code":"200"}
+{"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.949706948Z","hostname":"oxz_switch","pid":1717,"uri":"/arp?page_token=eyJ2IjoidjEiLCJwYWdlX3N0YXJ0Ijp7ImlwIjoiNy4yNDcuMjI5LjEyOSJ9fQ%3D%3D","method":"GET","req_id":"0414bdfc-68d2-4547-972c-56cc12c67c0d","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":91,"response_code":"200"}
+...
+----

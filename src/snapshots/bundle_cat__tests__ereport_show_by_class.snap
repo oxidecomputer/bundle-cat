@@ -1,0 +1,26 @@
+---
+source: bundle-cat/src/main.rs
+expression: "String::from_utf8_lossy(&class_out)"
+---
+==> ereports/913-0000019-BRM09250001/660f9511-f3ac-52e5-b827-557766551111/2596069104.json <==
+{
+  "class": "ereport.cpu.amd.bus_interconnect_error",
+  "collector_id": "8d4b9c01-e345-5678-90bc-def012345678",
+  "cpu_id": 3,
+  "ena": "0x000000009abcdef0",
+  "error_type": "bus_interconnect",
+  "machine_check": {
+    "bank": 0,
+    "status": "0x1234567890abcdef"
+  },
+  "part_number": "913-0000019",
+  "reporter": {
+    "HostOs": {
+      "sled": "9e5cad12-f456-6789-a1cd-ef0123456789"
+    }
+  },
+  "restart_id": "660f9511-f3ac-52e5-b827-557766551111",
+  "serial_number": "BRM09250001",
+  "time_collected": "2025-10-11T14:45:22.456Z",
+  "time_deleted": "2025-10-11T15:00:00.000Z"
+}

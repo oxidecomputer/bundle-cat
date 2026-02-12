@@ -1,0 +1,7 @@
+---
+source: bundle-cat/src/main.rs
+expression: "String::from_utf8_lossy(&sled_uuid_out)"
+---
+global
+oxz_nexus_b48c76b6-656f-4258-862a-4d2a2b9abfc0
+oxz_ntp_b4c60b54-c6e8-40e8-90f6-57a7ee2ce107
