@@ -21,8 +21,9 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::process;
+use std::process::{self, Command, Stdio};
 use std::str;
+use std::thread;
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
@@ -126,6 +127,11 @@ struct LogsArgs {
     /// Don't display the file name header when outputting file contents.
     #[arg(long)]
     no_header: bool,
+
+    /// Pipe the contents of each selected file to the standard input of this command.
+    /// The command will be executed as '$SHELL -c <EXEC>'.
+    #[arg(short, long)]
+    exec: Option<String>,
 }
 
 #[derive(Args, Default, Debug)]
@@ -193,15 +199,18 @@ fn exec() -> Result<()> {
     let bundle_info = BundleInfo::from_archive(&mut archive)
         .context("failed to parse sled information from bundle")?;
 
-    let stdout = io::stdout().lock();
     match &args.command {
-        Commands::Ereports(EreportCmds::List(l)) => exec_ereports_list(&mut archive, l, stdout),
-        Commands::Ereports(EreportCmds::Show(s)) => exec_ereports_show(&mut archive, s, stdout),
+        Commands::Ereports(EreportCmds::List(l)) => {
+            exec_ereports_list(&mut archive, l, io::stdout())
+        }
+        Commands::Ereports(EreportCmds::Show(s)) => {
+            exec_ereports_show(&mut archive, s, io::stdout())
+        }
 
-        Commands::Logs(l) => exec_logs(&mut archive, &bundle_info, l, stdout),
-        Commands::Services(s) => exec_services(&bundle_info, s, stdout),
-        Commands::Sleds => exec_sleds(&bundle_info, stdout),
-        Commands::Zones(z) => exec_zones(&bundle_info, z, stdout),
+        Commands::Logs(l) => exec_logs(&mut archive, &bundle_info, l, io::stdout()),
+        Commands::Services(s) => exec_services(&bundle_info, s, io::stdout()),
+        Commands::Sleds => exec_sleds(&bundle_info, io::stdout()),
+        Commands::Zones(z) => exec_zones(&bundle_info, z, io::stdout()),
     }
 }
 
@@ -641,7 +650,7 @@ fn exec_ereports_show<R: Read + Seek, W: Write>(
     Ok(())
 }
 
-fn exec_logs<R: Read + Seek, W: Write>(
+fn exec_logs<R: Read + Seek, W: Write + Send>(
     archive: &mut ZipArchive<R>,
     bundle_info: &BundleInfo,
     args: &LogsArgs,
@@ -721,33 +730,45 @@ fn exec_logs<R: Read + Seek, W: Write>(
             writeln!(out, "==> {} <==", file.name())?;
         }
 
-        if let Some(line_ct) = args.line_ct.map(|l| l.get()) {
-            let (cached_lines, ending_offset) = time_check_buf
-                .as_ref()
-                .map(|tc| {
-                    let mut cached = 0;
-                    let mut end = 0;
-                    for i in tc.find_iter(b"\n").take(line_ct) {
-                        cached += 1;
-                        end = i;
-                    }
-                    (cached, end)
-                })
-                .unwrap_or((0, 0));
+        if let Some(exec) = &args.exec {
+            let shell = std::env::var("SHELL").unwrap_or("/bin/sh".to_string());
+            let mut child = Command::new(&shell)
+                .arg("-c")
+                .arg(exec)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?;
 
-            match &time_check_buf {
-                Some(tc) if cached_lines == line_ct => out.write_all(&tc[..=ending_offset])?,
-                Some(tc) => {
-                    out.write_all(tc)?;
-                    write_n_lines(&mut file, &mut out, line_ct - cached_lines)?;
-                }
-                None => write_n_lines(&mut file, &mut out, line_ct)?,
+            let mut child_in = child.stdin.take().unwrap();
+            let mut child_out = child.stdout.take().unwrap();
+
+            let copy_result = thread::scope(|s| {
+                let out_writer = s.spawn(|| io::copy(&mut child_out, &mut out));
+
+                let in_result = write_file_content(
+                    &time_check_buf,
+                    &mut file,
+                    &mut child_in,
+                    args.line_ct.map(|l| l.get()),
+                );
+                drop(child_in); // EOF.
+
+                let out_result = out_writer.join().unwrap();
+                in_result.and(out_result)
+            });
+            copy_result?;
+
+            let status = child.wait()?;
+            if !status.success() {
+                anyhow::bail!("command '{exec}' exited with {status}");
             }
         } else {
-            if let Some(tc) = &time_check_buf {
-                out.write_all(tc)?;
-            }
-            io::copy(&mut file, &mut out)?;
+            write_file_content(
+                &time_check_buf,
+                &mut file,
+                &mut out,
+                args.line_ct.map(|l| l.get()),
+            )?;
         }
 
         if !args.no_header {
@@ -779,7 +800,48 @@ struct LogTimestamp {
     time: Timestamp,
 }
 
-fn write_n_lines<R: Read, W: Write>(mut reader: R, mut writer: W, line_ct: usize) -> Result<()> {
+fn write_file_content<R: Read, W: Write>(
+    time_check_buf: &Option<Vec<u8>>,
+    file: &mut R,
+    out: &mut W,
+    line_ct: Option<usize>,
+) -> io::Result<()> {
+    if let Some(line_ct) = line_ct {
+        let (cached_lines, ending_offset) = time_check_buf
+            .as_ref()
+            .map(|tc| {
+                let mut cached = 0;
+                let mut end = 0;
+                for i in tc.find_iter(b"\n").take(line_ct) {
+                    cached += 1;
+                    end = i;
+                }
+                (cached, end)
+            })
+            .unwrap_or((0, 0));
+
+        match time_check_buf {
+            Some(tc) if cached_lines == line_ct => out.write_all(&tc[..=ending_offset])?,
+            Some(tc) => {
+                out.write_all(tc)?;
+                write_n_lines(file, out, line_ct - cached_lines)?;
+            }
+            None => write_n_lines(file, out, line_ct)?,
+        }
+    } else {
+        if let Some(tc) = time_check_buf {
+            out.write_all(tc)?;
+        }
+        io::copy(file, out)?;
+    }
+    Ok(())
+}
+
+fn write_n_lines<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    line_ct: usize,
+) -> io::Result<()> {
     if line_ct == 0 {
         return Ok(());
     }
@@ -1410,6 +1472,35 @@ mod tests {
         )
         .unwrap();
         assert_snapshot!("logs_no_header", String::from_utf8_lossy(&no_header_out));
+
+        let mut exec_out = Vec::new();
+        exec_logs(
+            &mut zip,
+            &bundle_info,
+            &LogsArgs {
+                service: vec![Pattern::new("dendrite").unwrap()],
+                exec: Some("jq -C .".to_string()),
+                ..Default::default()
+            },
+            &mut exec_out,
+        )
+        .unwrap();
+        assert_snapshot!("logs_exec", String::from_utf8_lossy(&exec_out));
+
+        let mut exec_head_out = Vec::new();
+        exec_logs(
+            &mut zip,
+            &bundle_info,
+            &LogsArgs {
+                service: vec![Pattern::new("dendrite").unwrap()],
+                line_ct: Some(NonZeroUsize::new(2).unwrap()),
+                exec: Some("jq -C .".to_string()),
+                ..Default::default()
+            },
+            &mut exec_head_out,
+        )
+        .unwrap();
+        assert_snapshot!("logs_exec_head", String::from_utf8_lossy(&exec_head_out));
     }
 
     #[test]
