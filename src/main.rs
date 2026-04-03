@@ -371,12 +371,12 @@ impl BundleInfo {
 
             let services = sled_services
                 .remove(&uuid)
-                .expect("BUG: no services for sled")
+                .unwrap_or_default()
                 .into_iter()
                 .collect();
             let zones = sled_zones
                 .remove(&uuid)
-                .expect("BUG: no zones for sled")
+                .unwrap_or_default()
                 .into_iter()
                 .collect();
 
@@ -927,6 +927,34 @@ fn exec_sleds<W: Write>(bundle_info: &BundleInfo, mut out: W) -> Result<()> {
         for (serial, cubby) in unhealthy_by_cubby {
             let cubby = cubby.map(|c| c.to_string()).unwrap_or_default();
             writeln!(out, "{:>2}\t{}", cubby, serial,)?;
+        }
+    }
+
+    let incomplete: Vec<_> = bundle_info
+        .sleds
+        .values()
+        .filter(|s| s.services.is_empty() || s.zones.is_empty())
+        .collect();
+
+    if !incomplete.is_empty() {
+        writeln!(
+            out,
+            "\nPOSSIBLY UNREACHABLE SLEDS \n{:>2}\t{:<11}\t{:<36}\tMISSING BUNDLE OUTPUT",
+            "CUBBY", "SERIAL", "ID"
+        )?;
+        for sled in &incomplete {
+            let cubby = sled.cubby.map(|c| c.to_string()).unwrap_or_default();
+            let missing = match (sled.services.is_empty(), sled.zones.is_empty()) {
+                (true, true) => "services, zones",
+                (true, false) => "services",
+                (false, true) => "zones",
+                _ => unreachable!(),
+            };
+            writeln!(
+                out,
+                "{:>2}\t{}\t{}\t{}",
+                cubby, sled.serial, sled.uuid, missing
+            )?;
         }
     }
 
@@ -1592,6 +1620,71 @@ mod tests {
         assert_eq!(
             read_ereport_class(ereport_str),
             Some("ereport.io.pci.device")
+        );
+    }
+
+    /// Build a zip containing a sled with sled.txt but no logs/{zone}/{service} descendants
+    #[test]
+    fn test_incomplete_bundle_sled_no_services_or_zones() {
+        let sled_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let sled_txt = format!(
+            r#"Sled {{ identity: SledIdentity {{ id: {sled_uuid}, time_created: 2025-05-08T20:31:05.863348Z, time_modified: 2025-05-08T20:31:05.863348Z }}, time_deleted: None, rcgen: Generation(Generation(1)), rack_id: 34261901-b550-451c-9bd0-3926bb29c40d, is_scrimlet: false, serial_number: "BRM99990001", part_number: "913-0000019", revision: SqlU32(14), usable_hardware_threads: SqlU32(128), usable_physical_ram: ByteCount(ByteCount(2186120527872)), reservoir_size: ByteCount(ByteCount(1790577737728)), ip: fd00:1122:3344:108::1, port: SqlU16(12345), last_used_address: fd00:1122:3344:108::1:7, policy: InService, state: Active, sled_agent_gen: Generation(Generation(1)), repo_depot_port: SqlU16(12348) }}"#
+        );
+
+        let sled_dir = format!("rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/{sled_uuid}/");
+        let sled_txt_path =
+            format!("rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/{sled_uuid}/sled.txt");
+
+        let files: Vec<(&str, Option<&str>)> = vec![
+            ("rack/", None),
+            ("rack/34261901-b550-451c-9bd0-3926bb29c40d/", None),
+            ("rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/", None),
+            (&sled_dir, None),
+            (&sled_txt_path, Some(sled_txt.as_str())),
+        ];
+
+        let mut buf = Vec::new();
+        {
+            let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+            let options =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            for (name, contents) in &files {
+                if let Some(contents) = contents {
+                    zip.start_file(*name, options).unwrap();
+                    zip.write_all(contents.as_bytes()).unwrap();
+                    zip.write_all(b"\n").unwrap();
+                } else {
+                    zip.add_directory(*name, options).unwrap();
+                }
+            }
+            zip.finish().unwrap();
+        }
+
+        let cursor = Cursor::new(&mut buf);
+        let mut archive = ZipArchive::new(cursor).unwrap();
+        let bundle_info = BundleInfo::from_archive(&mut archive).unwrap();
+
+        // The sled should be present with empty services and zones.
+        let sled = bundle_info.sleds.get(sled_uuid).expect("sled should exist");
+        assert_eq!(sled.uuid, sled_uuid);
+        assert_eq!(sled.serial, "BRM99990001");
+        assert!(sled.services.is_empty(), "services should be empty");
+        assert!(sled.zones.is_empty(), "zones should be empty");
+        assert!(!sled.is_scrimlet);
+
+        // exec_sleds should succeed and report the sled as incomplete.
+        let mut out = Vec::new();
+        exec_sleds(&bundle_info, &mut out).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains(sled_uuid));
+        assert!(output.contains("BRM99990001"));
+        assert!(
+            output.contains("MISSING OUTPUT"),
+            "output should contain incomplete sleds section"
+        );
+        assert!(
+            output.contains("services, zones"),
+            "output should report both services and zones as missing"
         );
     }
 
