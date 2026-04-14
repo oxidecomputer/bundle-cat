@@ -1664,27 +1664,11 @@ mod tests {
         let mut archive = ZipArchive::new(cursor).unwrap();
         let bundle_info = BundleInfo::from_archive(&mut archive).unwrap();
 
-        // The sled should be present with empty services and zones.
-        let sled = bundle_info.sleds.get(sled_uuid).expect("sled should exist");
-        assert_eq!(sled.uuid, sled_uuid);
-        assert_eq!(sled.serial, "BRM99990001");
-        assert!(sled.services.is_empty(), "services should be empty");
-        assert!(sled.zones.is_empty(), "zones should be empty");
-        assert!(!sled.is_scrimlet);
-
-        // exec_sleds should succeed and report the sled as incomplete.
         let mut out = Vec::new();
         exec_sleds(&bundle_info, &mut out).unwrap();
-        let output = String::from_utf8(out).unwrap();
-        assert!(output.contains(sled_uuid));
-        assert!(output.contains("BRM99990001"));
-        assert!(
-            output.contains("MISSING OUTPUT"),
-            "output should contain incomplete sleds section"
-        );
-        assert!(
-            output.contains("services, zones"),
-            "output should report both services and zones as missing"
+        assert_snapshot!(
+            "sleds_incomplete_bundle",
+            String::from_utf8_lossy(&out)
         );
     }
 
