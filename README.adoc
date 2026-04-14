@@ -19,7 +19,7 @@ List zones in the bundle, optionally filtering by sled serial or id:
 
 [source]
 ----
-$ bundle-cat bundle_2025-09-24_10-30.zip zones --sleds BRM03250047
+$ bundle-cat bundle_2025-09-24_10-30.zip zones --sled BRM03250047
 global
 oxz_crucible_2199a890-b984-4f69-aba9-b0193c038772
 ...
@@ -29,7 +29,7 @@ List all files with names ending in '.json':
 
 [source]
 ----
-$ bundle-cat bundle_2025-09-24_10-30.zip logs --sleds BRM03250047 --paths '*.json' --list
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --sled BRM03250047 --path '*.json' --list
 rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/0f16e501-0b41-4b14-aa24-a81b791d71fb/dladm.json
 rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/0f16e501-0b41-4b14-aa24-a81b791d71fb/health-check.json
 ...
@@ -39,7 +39,7 @@ List all log files for the `dendrite` service:
 
 [source]
 ----
-$ bundle-cat bundle_2025-09-24_10-30.zip logs --services 'dendri*' --list
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --service dendrite --list
 rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758688200
 rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758691800
 ...
@@ -49,7 +49,7 @@ Print the first five lines of the matching files:
 
 [source]
 ----
-$ bundle-cat bundle_2025-09-24_10-30.zip logs --services 'dendri*' --head
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --service 'dendri*' --head
 ==> rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758688200 <==
 {"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.395830378Z","hostname":"oxz_switch","pid":1717,"uri":"/ndp","method":"GET","req_id":"edcc74ae-0f62-4575-a9e1-71fd9c8b071a","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":164,"response_code":"200"}
 {"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.460727138Z","hostname":"oxz_switch","pid":1717,"uri":"/ndp?page_token=eyJ2IjoidjEiLCJwYWdlX3N0YXJ0Ijp7ImlwIjoiZmU4MDo6YWE0MDoyNWZmOmZlMDU6M2EyMiJ9fQ%3D%3D","method":"GET","req_id":"849734a9-5595-49bd-95d2-02024e4f767a","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":79,"response_code":"200"}
@@ -70,7 +70,7 @@ Print the full contents of all matching files:
 
 [source]
 ----
-$ bundle-cat bundle_2025-09-24_10-30.zip logs --services 'dendri*'
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --service 'dendri*'
 ==> rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758688200 <==
 {"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.395830378Z","hostname":"oxz_switch","pid":1717,"uri":"/ndp","method":"GET","req_id":"edcc74ae-0f62-4575-a9e1-71fd9c8b071a","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":164,"response_code":"200"}
 {"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.460727138Z","hostname":"oxz_switch","pid":1717,"uri":"/ndp?page_token=eyJ2IjoidjEiLCJwYWdlX3N0YXJ0Ijp7ImlwIjoiZmU4MDo6YWE0MDoyNWZmOmZlMDU6M2EyMiJ9fQ%3D%3D","method":"GET","req_id":"849734a9-5595-49bd-95d2-02024e4f767a","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":79,"response_code":"200"}
@@ -78,4 +78,32 @@ $ bundle-cat bundle_2025-09-24_10-30.zip logs --services 'dendri*'
 {"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.949284122Z","hostname":"oxz_switch","pid":1717,"uri":"/arp","method":"GET","req_id":"ca1619e1-1dc9-4a06-b5b9-80c4d5eb964f","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":92,"response_code":"200"}
 {"msg":"request completed","v":0,"name":"dpd","level":30,"time":"2025-09-24T03:30:01.949706948Z","hostname":"oxz_switch","pid":1717,"uri":"/arp?page_token=eyJ2IjoidjEiLCJwYWdlX3N0YXJ0Ijp7ImlwIjoiNy4yNDcuMjI5LjEyOSJ9fQ%3D%3D","method":"GET","req_id":"0414bdfc-68d2-4547-972c-56cc12c67c0d","remote_addr":"[::1]:45845","local_addr":"[::1]:12224","server_id":"2","unit":"api-server","latency_us":91,"response_code":"200"}
 ...
+----
+
+Look at all service logs from a specific sled around the time a given instance was created or destroyed:
+
+[source]
+----
+$ bundle-cat bundle.zip logs --sled '0fadd43a*' \
+    --after '2026-04-02T17:50:00Z' --before '2026-04-02T18:00:00Z'
+----
+
+Or more specifically, logs for a given service from said sled in the time window:
+
+[source]
+----
+$ bundle-cat bundle.zip logs --sled '0fadd43a*' --service sled-agent \
+    --after '2026-04-02T17:50:00Z' --before '2026-04-02T18:00:00Z'
+----
+
+Pipe each matching file through `jq` or https://github.com/oxidecomputer/looker[looker] for pretty-printed, colorized output:
+
+[source]
+----
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --service sled-agent --exec 'jq -C .'
+----
+
+[source]
+----
+$ bundle-cat bundle_2025-09-24_10-30.zip logs --service sled-agent | looker
 ----

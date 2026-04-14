@@ -1,0 +1,11 @@
+---
+source: src/main.rs
+assertion_line: 1669
+expression: "String::from_utf8_lossy(&out)"
+---
+CUBBY	SERIAL     	ID                                  	SCRIMLET
+  	BRM99990001	aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee	   false
+
+POSSIBLY UNREACHABLE SLEDS 
+CUBBY	SERIAL     	ID                                  	MISSING BUNDLE OUTPUT
+  	BRM99990001	aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee	services, zones
