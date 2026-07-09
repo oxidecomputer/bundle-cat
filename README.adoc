@@ -2,6 +2,81 @@
 
 A small tool to find and print files from support bundles.
 
+This repository is a Cargo workspace with two crates:
+
+* `bundle-cat-lib` -- library for programmatic access to support bundle contents
+* `bundle-cat` -- CLI binary (thin wrapper around the library)
+
+== Building
+
+[source]
+----
+$ cargo install --path bundle-cat
+----
+
+== Library use
+
+`bundle-cat-lib` can read a zipped support bundle, an unpacked directory, or a
+custom synchronous source:
+
+[source,rust]
+----
+use bundle_cat_lib::Bundle;
+
+let zip_bundle = Bundle::open("support-bundle.zip")?;
+let directory_bundle = Bundle::open_dir("unpacked-support-bundle")?;
+# Ok::<(), anyhow::Error>(())
+----
+
+Implement `BundleSource` to provide another backing store. A source lists
+bundle-relative names, opens one named file as a `Read` stream, and returns
+optional length and modification-time metadata. Sources can be selected at
+runtime with `Box<dyn BundleSource>` and passed to `Bundle::from_source`:
+
+[source,rust]
+----
+use bundle_cat_lib::{Bundle, BundleSource};
+
+let source: Box<dyn BundleSource> = Box::new(my_source);
+let mut bundle = Bundle::from_source(source)?;
+# Ok::<(), anyhow::Error>(())
+----
+
+`Bundle::info` exposes structured sled, zone, and service data.
+`Bundle::for_each_log` streams matching logs to a callback. Ereports are
+available without parsing CLI output through `Bundle::for_each_ereport` or the
+`Bundle::ereports` collection convenience:
+
+[source,rust]
+----
+use bundle_cat_lib::EreportFilter;
+
+for entry in bundle.ereports(&EreportFilter::default())? {
+    println!("{}: {:?}", entry.path, entry.class);
+    // entry.metadata contains part, serial, restart ID, and ENA;
+    // entry.contents contains the original file contents.
+}
+# Ok::<(), anyhow::Error>(())
+----
+
+The narrow `parse_sled_txt` and `parse_ereport_path` functions are also public
+for operators who need to parse those records outside a complete `Bundle`.
+
+=== Library API compatibility
+
+The source abstraction introduces two intentional compile-time API changes:
+
+* `Bundle` is now parameterized by its source. Code that explicitly named a
+  type such as `Bundle<File>` should use
+  `Bundle<ZipBundleSource<File>>`. Calls to `Bundle::open` and
+  `Bundle::from_reader` continue to infer the zip-backed type.
+* The reader passed to `Bundle::for_each_log` callbacks is now
+  `&mut dyn Read`, not `zip::read::ZipFile`. Callbacks should depend only on
+  sequential `Read` operations.
+
+The `bundle-cat` command-line interface remains zip-only and retains its
+existing command shape. Directory and custom sources are library APIs.
+
 == Usage
 
 List sleds in the bundle:
