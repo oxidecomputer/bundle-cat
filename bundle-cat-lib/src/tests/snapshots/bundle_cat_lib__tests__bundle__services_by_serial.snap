@@ -1,5 +1,5 @@
 ---
-source: bundle-cat/src/main.rs
+source: bundle-cat-lib/src/tests/bundle.rs
 expression: "String::from_utf8_lossy(&sled_serial_out)"
 ---
 dendrite

@@ -1,8 +1,7 @@
 ---
-source: bundle-cat/src/main.rs
-expression: "String::from_utf8_lossy(&unfiltered_out)"
+source: bundle-cat-lib/src/tests/ereport.rs
+expression: "String::from_utf8_lossy(&no_header_out)"
 ---
-==> ereports/907-0000023-BRM03250000/550e8400-e29b-41d4-a716-446655440000/305419896.json <==
 {
   "class": "ereport.io.pci.device",
   "collector_id": "7c3a8b90-f234-4567-89ab-cdef01234567",
@@ -26,8 +25,6 @@ expression: "String::from_utf8_lossy(&unfiltered_out)"
   "time_deleted": null,
   "timestamp": 12345
 }
-
-==> ereports/913-0000019-BRM09250001/660f9511-f3ac-52e5-b827-557766551111/2596069104.json <==
 {
   "class": "ereport.cpu.amd.bus_interconnect_error",
   "collector_id": "8d4b9c01-e345-5678-90bc-def012345678",

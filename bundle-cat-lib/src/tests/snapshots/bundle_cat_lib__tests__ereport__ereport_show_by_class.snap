@@ -1,6 +1,6 @@
 ---
-source: bundle-cat/src/main.rs
-expression: "String::from_utf8_lossy(&serial_out)"
+source: bundle-cat-lib/src/tests/ereport.rs
+expression: "String::from_utf8_lossy(&class_out)"
 ---
 ==> ereports/913-0000019-BRM09250001/660f9511-f3ac-52e5-b827-557766551111/2596069104.json <==
 {

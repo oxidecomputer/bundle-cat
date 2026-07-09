@@ -1,6 +1,5 @@
 ---
-source: src/main.rs
-assertion_line: 1669
+source: bundle-cat-lib/src/tests/bundle.rs
 expression: "String::from_utf8_lossy(&out)"
 ---
 CUBBY	SERIAL     	ID                                  	SCRIMLET
