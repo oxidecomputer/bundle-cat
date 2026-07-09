@@ -121,13 +121,27 @@ name = "bundle-cat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bstr",
+ "bundle-cat-lib",
  "clap",
+ "glob",
+ "insta",
+ "jiff",
+ "serde_json",
+ "zip",
+]
+
+[[package]]
+name = "bundle-cat-lib"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bstr",
  "glob",
  "insta",
  "jiff",
  "serde",
  "serde_json",
+ "tempfile",
  "zip",
 ]
 
