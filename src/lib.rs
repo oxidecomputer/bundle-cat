@@ -6,11 +6,8 @@
 
 use anyhow::{Context as _, Result};
 use bstr::ByteSlice;
-use clap::{Args, Parser, Subcommand};
 use glob::Pattern;
-use jiff::civil::DateTime;
-use jiff::tz::TimeZone;
-use jiff::{Span, Timestamp};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 use zip::ZipArchive;
@@ -20,198 +17,94 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
-use std::process::{self, Command, Stdio};
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::str;
 use std::thread;
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
 
-#[derive(Parser, Debug)]
-#[command(about = "Filter and extract logs from support bundles")]
-struct Cli {
-    /// Path to the support bundle zip file.
-    zip_path: PathBuf,
-
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// List and display ereports.
-    #[command(subcommand)]
-    Ereports(EreportCmds),
-    /// Filter for and print log files.
-    Logs(LogsArgs),
-    /// List services in the support bundle.
-    Services(ServicesArgs),
-    /// List sleds in the support bundle.
-    Sleds,
-    /// List zones in the support bundle.
-    Zones(ZonesArgs),
-}
-
-#[derive(Subcommand, Debug)]
-enum EreportCmds {
-    /// List ereports.
-    List(EreportListArgs),
-    /// Display error reports.
-    Show(EreportShowArgs),
-}
-
-#[derive(Args, Default, Debug)]
-struct EreportListArgs {
+/// Glob-pattern filters selecting ereports by hardware component.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ComponentInfo<'a> {
     /// Part number glob patterns, (e.g., "123-0000456", "123-0004*").
-    #[arg(short, long, value_name = "PART_PATTERN")]
-    part: Vec<Pattern>,
+    pub part: &'a [Pattern],
     /// Serial number glob patterns, (e.g., "BRM03250000", "BRM0325*").
-    #[arg(short, long, value_name = "SERIAL_PATTERN")]
-    serial: Vec<Pattern>,
+    pub serial: &'a [Pattern],
     /// Class glob patterns, (e.g., "hw.insert.psu", "hw.*").
-    #[arg(short, long, value_name = "CLASS_PATTERN")]
-    class: Vec<Pattern>,
+    pub class: &'a [Pattern],
 }
 
-#[derive(Args, Default, Debug)]
-struct EreportShowArgs {
-    /// Part number glob patterns, (e.g., "123-0000456", "123-0004*").
-    #[arg(short, long, value_name = "PART_PATTERN")]
-    part: Vec<Pattern>,
-    /// Serial number glob patterns, (e.g., "BRM03250000", "BRM0325*").
-    #[arg(short, long, value_name = "SERIAL_PATTERN")]
-    serial: Vec<Pattern>,
-    /// Class glob patterns, (e.g., "hw.insert.psu", "hw.*").
-    #[arg(short, long, value_name = "CLASS_PATTERN")]
-    class: Vec<Pattern>,
-    /// Don't display the file name header when outputting file contents.
-    #[arg(long)]
-    no_header: bool,
-}
-
-#[derive(Args, Default, Debug)]
-struct LogsArgs {
+/// Glob-pattern filters selecting which log files to include.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct LogFilter<'a> {
     /// Sled cubby number, serial number or UUID glob patterns (e.g., "16", "BRM032500*", "0f16e501-*").
-    #[arg(short, long, value_name = "SLED_PATTERN")]
-    sled: Vec<Pattern>,
+    pub sled: &'a [Pattern],
 
     /// Service name glob patterns to filter (e.g., "mg-ddm", "ntp*").
-    #[arg(short = 'S', long, value_name = "SERVICE_PATTERN")]
-    service: Vec<Pattern>,
+    pub service: &'a [Pattern],
 
     /// Zone name glob patterns to filter (e.g., "oxz_switch", "oxz_nexus*").
-    #[arg(short, long, value_name = "ZONE_PATTERN")]
-    zone: Vec<Pattern>,
+    pub zone: &'a [Pattern],
 
     /// File path glob patterns to filter (e.g., "bundle_id.txt", "*nvmeadm.json").
-    #[arg(short, long, value_name = "PATH_PATTERN")]
-    path: Vec<Pattern>,
+    pub path: &'a [Pattern],
+}
 
-    /// Only include archived files with timestamps after this time.
-    #[arg(short = 'A', long, value_parser = parse_timestamp_now, value_name = "TIMESTAMP")]
-    after: Option<Timestamp>,
+/// A time window bounding which archived log files to include.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct TimeRange {
+    /// Only include files with timestamps after this time.
+    pub after: Option<Timestamp>,
 
-    /// Only include archived files with timestamps before this time.
-    #[arg(short = 'B', long, value_parser = parse_timestamp_now, value_name = "TIMESTAMP")]
-    before: Option<Timestamp>,
+    /// Only include files with timestamps before this time.
+    pub before: Option<Timestamp>,
+}
 
+impl TimeRange {
+    /// Whether either bound is set, i.e. whether time filtering was requested.
+    pub fn is_set(&self) -> bool {
+        self.after.is_some() || self.before.is_some()
+    }
+
+    /// Whether `ts` falls within the range. Timestamps from before 2001 are
+    /// always excluded, as they indicate a missing or bogus time.
+    pub fn contains(&self, ts: Timestamp) -> bool {
+        if &ts < JANUARY_1_2001 {
+            return false;
+        }
+
+        let before = self.before.unwrap_or(Timestamp::MAX);
+        let after = self.after.unwrap_or(Timestamp::MIN);
+
+        ts < before && ts > after
+    }
+}
+
+/// How to render the selected log files.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct LogOutput<'a> {
     /// List matching files without printing their contents.
-    #[arg(short, long)]
-    list: bool,
+    pub list: bool,
 
     /// Number of lines to print from matching files.
-    #[arg(short = 'L', long = "head", default_missing_value = "5", num_args = 0..=1)]
-    line_ct: Option<NonZeroUsize>,
+    pub line_ct: Option<NonZeroUsize>,
 
     /// Don't display the file name header when outputting file contents.
-    #[arg(long)]
-    no_header: bool,
+    pub no_header: bool,
 
     /// Pipe the contents of each selected file to the standard input of this command.
     /// The command will be executed as '$SHELL -c <EXEC>'.
-    #[arg(short, long)]
-    exec: Option<String>,
+    pub exec: Option<&'a str>,
 }
 
-#[derive(Args, Default, Debug)]
-struct ServicesArgs {
-    /// Sled cubby number, serial number or UUID glob patterns (e.g., "16", "BRM032500*", "0f16e501-*").
-    #[arg(short, long, value_name = "SLED_PATTERN")]
-    sled: Vec<Pattern>,
-}
-
-#[derive(Args, Default, Debug)]
-struct ZonesArgs {
-    /// Sled cubby number, serial number or UUID glob patterns (e.g., "16", "BRM032500*", "0f16e501-*").
-    #[arg(short, long, value_name = "SLED_PATTERN")]
-    sled: Vec<Pattern>,
-}
-
-fn parse_timestamp_now(date_str: &str) -> Result<Timestamp, anyhow::Error> {
-    parse_timestamp(Timestamp::now(), date_str)
-}
-
-fn parse_timestamp(relative_to: Timestamp, date_str: &str) -> Result<Timestamp, anyhow::Error> {
-    // Parse as both a TimeStamp, DateTime, and Span to provide maximum flexibility to users.
-    // Timestamp must have a timezone, while DateTime must not have a "Z" TZ.
-    let timestamp = date_str.parse::<Timestamp>();
-    let datetime = date_str.parse::<DateTime>();
-    let span = date_str.parse::<Span>();
-
-    match (timestamp, datetime, span) {
-        (Ok(ts), _, _) => Ok(ts),
-        (_, Ok(dt), _) => Ok(dt.to_zoned(TimeZone::UTC)?.timestamp()),
-        (_, _, Ok(s)) => {
-            // Convert to Zoned for addition, Timestamp cannot be offset by a full day or more.
-            let zoned = relative_to.to_zoned(TimeZone::UTC);
-            Ok(zoned.saturating_add(s).timestamp())
-        }
-        (Err(e), Err(_), Err(_)) => Err(anyhow::anyhow!("could not parse timestamp: {e}")),
-    }
-}
-
-fn main() {
-    if let Err(e) = exec() {
-        if let Some(io_err) = e.downcast_ref::<io::Error>()
-            && io_err.kind() == io::ErrorKind::BrokenPipe
-        {
-            return;
-        }
-
-        let _ = writeln!(io::stderr(), "{e:#}");
-        process::exit(1);
-    }
-}
-
-fn exec() -> Result<()> {
-    let args = Cli::parse();
-
-    let file = File::open(&args.zip_path).with_context(|| {
-        format!(
-            "failed to open suppport bundle zip: {}",
-            args.zip_path.display()
-        )
-    })?;
+/// Open a support bundle zip archive from a path on disk.
+pub fn open_bundle(path: &Path) -> Result<ZipArchive<BufReader<File>>> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open suppport bundle zip: {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut archive = ZipArchive::new(reader).context("failed to read zip archive")?;
-
-    let bundle_info = BundleInfo::from_archive(&mut archive)
-        .context("failed to parse sled information from bundle")?;
-
-    match &args.command {
-        Commands::Ereports(EreportCmds::List(l)) => {
-            exec_ereports_list(&mut archive, l, io::stdout())
-        }
-        Commands::Ereports(EreportCmds::Show(s)) => {
-            exec_ereports_show(&mut archive, s, io::stdout())
-        }
-
-        Commands::Logs(l) => exec_logs(&mut archive, &bundle_info, l, io::stdout()),
-        Commands::Services(s) => exec_services(&bundle_info, s, io::stdout()),
-        Commands::Sleds => exec_sleds(&bundle_info, io::stdout()),
-        Commands::Zones(z) => exec_zones(&bundle_info, z, io::stdout()),
-    }
+    ZipArchive::new(reader).context("failed to read zip archive")
 }
 
 #[derive(Debug)]
@@ -296,13 +189,13 @@ impl LogFile {
 }
 
 #[derive(Debug)]
-struct BundleInfo {
+pub struct BundleInfo {
     sleds: BTreeMap<String, SledInfo>,
     unhealthy_sleds: BTreeMap<String, Option<u16>>,
 }
 
 impl BundleInfo {
-    fn from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Self> {
+    pub fn from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Self> {
         let mut sled_txt_indices = Vec::with_capacity(32);
 
         let mut sleds = BTreeMap::new();
@@ -537,9 +430,9 @@ fn read_ereport_class(ereport_raw: &str) -> Option<&str> {
     Some(&ereport_raw[class_start..class_end])
 }
 
-fn exec_ereports_list<R: Read + Seek, W: Write>(
+pub fn bundle_ereports_list<R: Read + Seek, W: Write>(
     archive: &mut ZipArchive<R>,
-    args: &EreportListArgs,
+    components: ComponentInfo<'_>,
     mut out: W,
 ) -> Result<()> {
     let ereports: Vec<_> = archive
@@ -548,8 +441,8 @@ fn exec_ereports_list<R: Read + Seek, W: Write>(
         .filter_map(|(i, path)| {
             let ereport = Ereport::from_path(path)?;
 
-            if matches_patterns(&args.part, &ereport.part)
-                && matches_patterns(&args.serial, &ereport.serial)
+            if matches_patterns(components.part, &ereport.part)
+                && matches_patterns(components.serial, &ereport.serial)
             {
                 Some((i, ereport))
             } else {
@@ -575,10 +468,10 @@ fn exec_ereports_list<R: Read + Seek, W: Write>(
             .by_index(i)
             .with_context(|| format!("failed to access file index {i}"))?;
         let contents = read_file_to_string(&mut file)?;
-        let class = read_ereport_class(&contents);
+        let ereport_class = read_ereport_class(&contents);
 
-        if let Some(class) = class
-            && !matches_patterns(&args.class, class)
+        if let Some(ereport_class) = ereport_class
+            && !matches_patterns(components.class, ereport_class)
         {
             continue;
         }
@@ -589,16 +482,17 @@ fn exec_ereports_list<R: Read + Seek, W: Write>(
             ereport.serial,
             ereport.restart_id,
             ereport.ena,
-            class.unwrap_or("unknown"),
+            ereport_class.unwrap_or("unknown"),
         )?;
     }
 
     Ok(())
 }
 
-fn exec_ereports_show<R: Read + Seek, W: Write>(
+pub fn bundle_ereports_show<R: Read + Seek, W: Write>(
     archive: &mut ZipArchive<R>,
-    args: &EreportShowArgs,
+    components: ComponentInfo<'_>,
+    no_header: bool,
     mut out: W,
 ) -> Result<()> {
     let matching_reports: Vec<_> = archive
@@ -607,8 +501,8 @@ fn exec_ereports_show<R: Read + Seek, W: Write>(
         .filter_map(|(i, path)| {
             let ereport = Ereport::from_path(path)?;
 
-            if matches_patterns(&args.part, &ereport.part)
-                && matches_patterns(&args.serial, &ereport.serial)
+            if matches_patterns(components.part, &ereport.part)
+                && matches_patterns(components.serial, &ereport.serial)
             {
                 Some(i)
             } else {
@@ -624,13 +518,13 @@ fn exec_ereports_show<R: Read + Seek, W: Write>(
 
         let contents = read_file_to_string(&mut file)?;
 
-        if let Some(class) = read_ereport_class(&contents)
-            && !matches_patterns(&args.class, class)
+        if let Some(ereport_class) = read_ereport_class(&contents)
+            && !matches_patterns(components.class, ereport_class)
         {
             continue;
         }
 
-        if !args.no_header {
+        if !no_header {
             writeln!(out, "==> {} <==", file.name())?;
         }
 
@@ -642,7 +536,7 @@ fn exec_ereports_show<R: Read + Seek, W: Write>(
             out.write_all(contents.as_bytes())?;
         }
 
-        if !args.no_header {
+        if !no_header {
             writeln!(out)?;
         }
     }
@@ -650,10 +544,12 @@ fn exec_ereports_show<R: Read + Seek, W: Write>(
     Ok(())
 }
 
-fn exec_logs<R: Read + Seek, W: Write + Send>(
+pub fn bundle_logs<R: Read + Seek, W: Write + Send>(
     archive: &mut ZipArchive<R>,
     bundle_info: &BundleInfo,
-    args: &LogsArgs,
+    filter: LogFilter<'_>,
+    time: TimeRange,
+    output: LogOutput<'_>,
     mut out: W,
 ) -> Result<()> {
     let matching_files: Vec<_> = archive
@@ -667,10 +563,10 @@ fn exec_logs<R: Read + Seek, W: Write + Send>(
                 .get(&log_file.sled_uuid)
                 .expect("BUG: UUID was not found in collected sled info");
 
-            if sled_info.matches_patterns(&args.sled)
-                && log_file.matches_services(&args.service)
-                && log_file.matches_zones(&args.zone)
-                && log_file.matches_paths(&args.path)
+            if sled_info.matches_patterns(filter.sled)
+                && log_file.matches_services(filter.service)
+                && log_file.matches_zones(filter.zone)
+                && log_file.matches_paths(filter.path)
             {
                 Some((i, log_file))
             } else {
@@ -682,7 +578,7 @@ fn exec_logs<R: Read + Seek, W: Write + Send>(
     for (i, log) in matching_files {
         let mut file = archive.by_index(i)?;
 
-        let time_check_buf = if args.before.is_some() || args.after.is_some() {
+        let time_check_buf = if time.is_set() {
             const TIME_CHECK_MAX: u64 = 1 << 16;
             let buf_size = file.size().min(TIME_CHECK_MAX) as usize;
             let mut tc = vec![0u8; buf_size];
@@ -708,29 +604,26 @@ fn exec_logs<R: Read + Seek, W: Write + Send>(
                     civil.in_tz("UTC").ok().map(|t| t.timestamp())
                 });
 
-            if !ts.map_or_else(
-                || false,
-                |ts| within_time_range(&ts, &args.before, &args.after),
-            ) {
+            if !ts.is_some_and(|ts| time.contains(ts)) {
                 continue;
             }
 
             // Only retain buffer if we'll need it for output
-            (!args.list).then_some(tc)
+            (!output.list).then_some(tc)
         } else {
             None
         };
 
-        if args.list {
+        if output.list {
             writeln!(out, "{}", file.name())?;
             continue;
         }
 
-        if !args.no_header {
+        if !output.no_header {
             writeln!(out, "==> {} <==", file.name())?;
         }
 
-        if let Some(exec) = &args.exec {
+        if let Some(exec) = output.exec {
             let shell = std::env::var("SHELL").unwrap_or("/bin/sh".to_string());
             let mut child = Command::new(&shell)
                 .arg("-c")
@@ -749,7 +642,7 @@ fn exec_logs<R: Read + Seek, W: Write + Send>(
                     &time_check_buf,
                     &mut file,
                     &mut child_in,
-                    args.line_ct.map(|l| l.get()),
+                    output.line_ct.map(|l| l.get()),
                 );
                 drop(child_in); // EOF.
 
@@ -767,31 +660,16 @@ fn exec_logs<R: Read + Seek, W: Write + Send>(
                 &time_check_buf,
                 &mut file,
                 &mut out,
-                args.line_ct.map(|l| l.get()),
+                output.line_ct.map(|l| l.get()),
             )?;
         }
 
-        if !args.no_header {
+        if !output.no_header {
             writeln!(out)?;
         }
     }
 
     Ok(())
-}
-
-fn within_time_range(
-    ts: &Timestamp,
-    before: &Option<Timestamp>,
-    after: &Option<Timestamp>,
-) -> bool {
-    if ts < JANUARY_1_2001 {
-        return false;
-    }
-
-    let before = &before.unwrap_or(Timestamp::MAX);
-    let after = &after.unwrap_or(Timestamp::MIN);
-
-    ts < before && ts > after
 }
 
 /// Minimal struct to grab the timestamp from a JSON log event.
@@ -882,15 +760,15 @@ fn read_timestamp_from_contents(buf: &[u8]) -> Option<Timestamp> {
     None
 }
 
-fn exec_services<W: Write>(
+pub fn bundle_services<W: Write>(
     bundle_info: &BundleInfo,
-    args: &ServicesArgs,
+    sled: &[Pattern],
     mut out: W,
 ) -> Result<()> {
     let services: BTreeSet<_> = bundle_info
         .sleds
         .values()
-        .filter(|s| s.matches_patterns(&args.sled))
+        .filter(|s| s.matches_patterns(sled))
         .flat_map(|s| &s.services)
         .collect();
 
@@ -901,7 +779,7 @@ fn exec_services<W: Write>(
     Ok(())
 }
 
-fn exec_sleds<W: Write>(bundle_info: &BundleInfo, mut out: W) -> Result<()> {
+pub fn bundle_sleds<W: Write>(bundle_info: &BundleInfo, mut out: W) -> Result<()> {
     let mut by_cubby: Vec<_> = bundle_info.sleds.values().collect();
     by_cubby.sort_by(|a, b| a.cubby.cmp(&b.cubby));
 
@@ -961,11 +839,15 @@ fn exec_sleds<W: Write>(bundle_info: &BundleInfo, mut out: W) -> Result<()> {
     Ok(())
 }
 
-fn exec_zones<W: Write>(bundle_info: &BundleInfo, args: &ZonesArgs, mut out: W) -> Result<()> {
+pub fn bundle_zones<W: Write>(
+    bundle_info: &BundleInfo,
+    sled: &[Pattern],
+    mut out: W,
+) -> Result<()> {
     let zones: BTreeSet<_> = bundle_info
         .sleds
         .values()
-        .filter(|s| s.matches_patterns(&args.sled))
+        .filter(|s| s.matches_patterns(sled))
         .flat_map(|s| &s.zones)
         .collect();
 
@@ -1268,17 +1150,17 @@ mod tests {
         let mut zip = build_zip(&mut buf);
 
         let mut unfiltered_out = Vec::new();
-        exec_ereports_list(&mut zip, &EreportListArgs::default(), &mut unfiltered_out).unwrap();
+        bundle_ereports_list(&mut zip, ComponentInfo::default(), &mut unfiltered_out).unwrap();
         assert_snapshot!(
             "ereport_list_unfiltered",
             String::from_utf8_lossy(&unfiltered_out)
         );
 
         let mut serial_out = Vec::new();
-        exec_ereports_list(
+        bundle_ereports_list(
             &mut zip,
-            &EreportListArgs {
-                serial: vec![Pattern::from_str("BRM09*").unwrap()],
+            ComponentInfo {
+                serial: &[Pattern::from_str("BRM09*").unwrap()],
                 ..Default::default()
             },
             &mut serial_out,
@@ -1290,10 +1172,10 @@ mod tests {
         );
 
         let mut part_out = Vec::new();
-        exec_ereports_list(
+        bundle_ereports_list(
             &mut zip,
-            &EreportListArgs {
-                part: vec![Pattern::from_str("907*").unwrap()],
+            ComponentInfo {
+                part: &[Pattern::from_str("907*").unwrap()],
                 ..Default::default()
             },
             &mut part_out,
@@ -1302,10 +1184,10 @@ mod tests {
         assert_snapshot!("ereport_list_by_part", String::from_utf8_lossy(&part_out));
 
         let mut class_out = Vec::new();
-        exec_ereports_list(
+        bundle_ereports_list(
             &mut zip,
-            &EreportListArgs {
-                class: vec![Pattern::from_str("ereport.cpu*").unwrap()],
+            ComponentInfo {
+                class: &[Pattern::from_str("ereport.cpu*").unwrap()],
                 ..Default::default()
             },
             &mut class_out,
@@ -1320,34 +1202,33 @@ mod tests {
         let mut zip = build_zip(&mut buf);
 
         let mut unfiltered_out = Vec::new();
-        exec_ereports_show(&mut zip, &EreportShowArgs::default(), &mut unfiltered_out).unwrap();
+        bundle_ereports_show(
+            &mut zip,
+            ComponentInfo::default(),
+            false,
+            &mut unfiltered_out,
+        )
+        .unwrap();
         assert_snapshot!(
             "ereport_show_unfiltered",
             String::from_utf8_lossy(&unfiltered_out)
         );
 
         let mut no_header_out = Vec::new();
-        exec_ereports_show(
-            &mut zip,
-            &EreportShowArgs {
-                no_header: true,
-                ..Default::default()
-            },
-            &mut no_header_out,
-        )
-        .unwrap();
+        bundle_ereports_show(&mut zip, ComponentInfo::default(), true, &mut no_header_out).unwrap();
         assert_snapshot!(
             "ereport_show_no_header",
             String::from_utf8_lossy(&no_header_out)
         );
 
         let mut serial_out = Vec::new();
-        exec_ereports_show(
+        bundle_ereports_show(
             &mut zip,
-            &EreportShowArgs {
-                serial: vec![Pattern::from_str("BRM09*").unwrap()],
+            ComponentInfo {
+                serial: &[Pattern::from_str("BRM09*").unwrap()],
                 ..Default::default()
             },
+            false,
             &mut serial_out,
         )
         .unwrap();
@@ -1357,24 +1238,26 @@ mod tests {
         );
 
         let mut part_out = Vec::new();
-        exec_ereports_show(
+        bundle_ereports_show(
             &mut zip,
-            &EreportShowArgs {
-                part: vec![Pattern::from_str("907*").unwrap()],
+            ComponentInfo {
+                part: &[Pattern::from_str("907*").unwrap()],
                 ..Default::default()
             },
+            false,
             &mut part_out,
         )
         .unwrap();
         assert_snapshot!("ereport_show_by_part", String::from_utf8_lossy(&part_out));
 
         let mut class_out = Vec::new();
-        exec_ereports_show(
+        bundle_ereports_show(
             &mut zip,
-            &EreportShowArgs {
-                class: vec![Pattern::from_str("ereport.cpu*").unwrap()],
+            ComponentInfo {
+                class: &[Pattern::from_str("ereport.cpu*").unwrap()],
                 ..Default::default()
             },
+            false,
             &mut class_out,
         )
         .unwrap();
@@ -1388,85 +1271,99 @@ mod tests {
         let bundle_info = BundleInfo::from_archive(&mut zip).unwrap();
 
         let mut unfiltered_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs::default(),
+            LogFilter::default(),
+            TimeRange::default(),
+            LogOutput::default(),
             &mut unfiltered_out,
         )
         .unwrap();
         assert_snapshot!("logs_unfiltered", String::from_utf8_lossy(&unfiltered_out));
 
         let mut sled_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
-                sled: vec![Pattern::from_str("BRM03250013").unwrap()],
+            LogFilter {
+                sled: &[Pattern::from_str("BRM03250013").unwrap()],
                 ..Default::default()
             },
+            TimeRange::default(),
+            LogOutput::default(),
             &mut sled_out,
         )
         .unwrap();
         assert_snapshot!("logs_by_sled", String::from_utf8_lossy(&sled_out));
 
         let mut zone_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
-                zone: vec![Pattern::from_str("oxz_switch").unwrap()],
+            LogFilter {
+                zone: &[Pattern::from_str("oxz_switch").unwrap()],
                 ..Default::default()
             },
+            TimeRange::default(),
+            LogOutput::default(),
             &mut zone_out,
         )
         .unwrap();
         assert_snapshot!("logs_by_zone", String::from_utf8_lossy(&zone_out));
 
         let mut path_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
-                path: vec![Pattern::from_str("*sled.txt").unwrap()],
+            LogFilter {
+                path: &[Pattern::from_str("*sled.txt").unwrap()],
                 ..Default::default()
             },
+            TimeRange::default(),
+            LogOutput::default(),
             &mut path_out,
         )
         .unwrap();
         assert_snapshot!("logs_by_path", String::from_utf8_lossy(&path_out));
 
         let mut after_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
+            LogFilter::default(),
+            TimeRange {
                 after: Some("2025-09-24T06:00:00.0Z".parse::<Timestamp>().unwrap()),
                 ..Default::default()
             },
+            LogOutput::default(),
             &mut after_out,
         )
         .unwrap();
         assert_snapshot!("logs_by_after", String::from_utf8_lossy(&after_out));
 
         let mut before_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
+            LogFilter::default(),
+            TimeRange {
                 before: Some("2025-09-24T06:00:00.0Z".parse::<Timestamp>().unwrap()),
                 ..Default::default()
             },
+            LogOutput::default(),
             &mut before_out,
         )
         .unwrap();
         assert_snapshot!("logs_by_before", String::from_utf8_lossy(&before_out));
 
         let mut list_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
+            LogFilter::default(),
+            TimeRange::default(),
+            LogOutput {
                 list: true,
                 ..Default::default()
             },
@@ -1476,10 +1373,12 @@ mod tests {
         assert_snapshot!("logs_list", String::from_utf8_lossy(&list_out));
 
         let mut line_ct_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
+            LogFilter::default(),
+            TimeRange::default(),
+            LogOutput {
                 line_ct: Some(NonZeroUsize::new(2).unwrap()),
                 ..Default::default()
             },
@@ -1489,10 +1388,12 @@ mod tests {
         assert_snapshot!("logs_line_ct", String::from_utf8_lossy(&line_ct_out));
 
         let mut no_header_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
+            LogFilter::default(),
+            TimeRange::default(),
+            LogOutput {
                 no_header: true,
                 ..Default::default()
             },
@@ -1502,12 +1403,16 @@ mod tests {
         assert_snapshot!("logs_no_header", String::from_utf8_lossy(&no_header_out));
 
         let mut exec_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
-                service: vec![Pattern::new("dendrite").unwrap()],
-                exec: Some("jq -C .".to_string()),
+            LogFilter {
+                service: &[Pattern::new("dendrite").unwrap()],
+                ..Default::default()
+            },
+            TimeRange::default(),
+            LogOutput {
+                exec: Some("jq -C ."),
                 ..Default::default()
             },
             &mut exec_out,
@@ -1516,13 +1421,17 @@ mod tests {
         assert_snapshot!("logs_exec", String::from_utf8_lossy(&exec_out));
 
         let mut exec_head_out = Vec::new();
-        exec_logs(
+        bundle_logs(
             &mut zip,
             &bundle_info,
-            &LogsArgs {
-                service: vec![Pattern::new("dendrite").unwrap()],
+            LogFilter {
+                service: &[Pattern::new("dendrite").unwrap()],
+                ..Default::default()
+            },
+            TimeRange::default(),
+            LogOutput {
                 line_ct: Some(NonZeroUsize::new(2).unwrap()),
-                exec: Some("jq -C .".to_string()),
+                exec: Some("jq -C ."),
                 ..Default::default()
             },
             &mut exec_head_out,
@@ -1538,29 +1447,25 @@ mod tests {
         let bundle_info = BundleInfo::from_archive(&mut zip).unwrap();
 
         let mut unfiltered_out = Vec::new();
-        exec_services(&bundle_info, &ServicesArgs::default(), &mut unfiltered_out).unwrap();
+        bundle_services(&bundle_info, &[], &mut unfiltered_out).unwrap();
         assert_snapshot!(
             "services_unfiltered",
             String::from_utf8_lossy(&unfiltered_out)
         );
 
         let mut sled_uuid_out = Vec::new();
-        exec_services(
+        bundle_services(
             &bundle_info,
-            &ServicesArgs {
-                sled: vec![Pattern::from_str("f589c*").unwrap()],
-            },
+            &[Pattern::from_str("f589c*").unwrap()],
             &mut sled_uuid_out,
         )
         .unwrap();
         assert_snapshot!("services_by_uuid", String::from_utf8_lossy(&sled_uuid_out));
 
         let mut sled_serial_out = Vec::new();
-        exec_services(
+        bundle_services(
             &bundle_info,
-            &ServicesArgs {
-                sled: vec![Pattern::from_str("BRM03250013").unwrap()],
-            },
+            &[Pattern::from_str("BRM03250013").unwrap()],
             &mut sled_serial_out,
         )
         .unwrap();
@@ -1577,7 +1482,7 @@ mod tests {
         let bundle_info = BundleInfo::from_archive(&mut zip).unwrap();
 
         let mut out = Vec::new();
-        exec_sleds(&bundle_info, &mut out).unwrap();
+        bundle_sleds(&bundle_info, &mut out).unwrap();
         assert_snapshot!("sleds", String::from_utf8_lossy(&out));
     }
 
@@ -1588,26 +1493,22 @@ mod tests {
         let bundle_info = BundleInfo::from_archive(&mut zip).unwrap();
 
         let mut unfiltered_out = Vec::new();
-        exec_zones(&bundle_info, &ZonesArgs::default(), &mut unfiltered_out).unwrap();
+        bundle_zones(&bundle_info, &[], &mut unfiltered_out).unwrap();
         assert_snapshot!("zones_unfiltered", String::from_utf8_lossy(&unfiltered_out));
 
         let mut sled_uuid_out = Vec::new();
-        exec_zones(
+        bundle_zones(
             &bundle_info,
-            &ZonesArgs {
-                sled: vec![Pattern::from_str("f589c*").unwrap()],
-            },
+            &[Pattern::from_str("f589c*").unwrap()],
             &mut sled_uuid_out,
         )
         .unwrap();
         assert_snapshot!("zones_by_uuid", String::from_utf8_lossy(&sled_uuid_out));
 
         let mut sled_serial_out = Vec::new();
-        exec_zones(
+        bundle_zones(
             &bundle_info,
-            &ZonesArgs {
-                sled: vec![Pattern::from_str("BRM03250013").unwrap()],
-            },
+            &[Pattern::from_str("BRM03250013").unwrap()],
             &mut sled_serial_out,
         )
         .unwrap();
@@ -1665,11 +1566,8 @@ mod tests {
         let bundle_info = BundleInfo::from_archive(&mut archive).unwrap();
 
         let mut out = Vec::new();
-        exec_sleds(&bundle_info, &mut out).unwrap();
-        assert_snapshot!(
-            "sleds_incomplete_bundle",
-            String::from_utf8_lossy(&out)
-        );
+        bundle_sleds(&bundle_info, &mut out).unwrap();
+        assert_snapshot!("sleds_incomplete_bundle", String::from_utf8_lossy(&out));
     }
 
     #[test]
