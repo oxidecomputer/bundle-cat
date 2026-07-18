@@ -121,7 +121,7 @@ struct LogsArgs {
     no_header: bool,
 
     /// Pipe the contents of each selected file to the standard input of this command.
-    /// The command will be executed as '$SHELL -c <EXEC>'.
+    /// The command will be executed as '$SHELL -c $EXEC'.
     #[arg(short, long)]
     exec: Option<String>,
 }
