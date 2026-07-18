@@ -10,13 +10,15 @@ use glob::Pattern;
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
+use zip::ZipArchive;
 
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufReader, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process;
 
-use bundle_cat::{BundleInfo, ComponentInfo, LogFilter, LogOutput, TimeRange};
+use bundle_cat::{Bundle, ComponentInfo, LogFilter, LogOutput, TimeRange};
 
 #[derive(Parser, Debug)]
 #[command(about = "Filter and extract logs from support bundles")]
@@ -179,14 +181,19 @@ fn main() {
 fn run() -> Result<()> {
     let args = Cli::parse();
 
-    let mut archive = bundle_cat::open_bundle(&args.zip_path)?;
-
-    let bundle_info = BundleInfo::from_archive(&mut archive)
-        .context("failed to parse sled information from bundle")?;
+    let file = File::open(&args.zip_path).with_context(|| {
+        format!(
+            "failed to open suppport bundle zip: {}",
+            args.zip_path.display()
+        )
+    })?;
+    let reader = BufReader::new(file);
+    let archive = ZipArchive::new(reader).context("failed to read zip archive")?;
+    let bundle =
+        Bundle::from_archive(archive).context("failed to parse sled information from bundle")?;
 
     match &args.command {
-        Commands::Ereports(EreportCmds::List(l)) => bundle_cat::bundle_ereports_list(
-            &mut archive,
+        Commands::Ereports(EreportCmds::List(l)) => bundle.ereports_list(
             ComponentInfo {
                 part: &l.part,
                 serial: &l.serial,
@@ -194,8 +201,7 @@ fn run() -> Result<()> {
             },
             io::stdout(),
         ),
-        Commands::Ereports(EreportCmds::Show(s)) => bundle_cat::bundle_ereports_show(
-            &mut archive,
+        Commands::Ereports(EreportCmds::Show(s)) => bundle.ereports_show(
             ComponentInfo {
                 part: &s.part,
                 serial: &s.serial,
@@ -205,9 +211,7 @@ fn run() -> Result<()> {
             io::stdout(),
         ),
 
-        Commands::Logs(l) => bundle_cat::bundle_logs(
-            &mut archive,
-            &bundle_info,
+        Commands::Logs(l) => bundle.logs(
             LogFilter {
                 sled: &l.sled,
                 service: &l.service,
@@ -226,8 +230,8 @@ fn run() -> Result<()> {
             },
             io::stdout(),
         ),
-        Commands::Services(s) => bundle_cat::bundle_services(&bundle_info, &s.sled, io::stdout()),
-        Commands::Sleds => bundle_cat::bundle_sleds(&bundle_info, io::stdout()),
-        Commands::Zones(z) => bundle_cat::bundle_zones(&bundle_info, &z.sled, io::stdout()),
+        Commands::Services(s) => bundle.services(&s.sled, io::stdout()),
+        Commands::Sleds => bundle.sleds(io::stdout()),
+        Commands::Zones(z) => bundle.zones(&z.sled, io::stdout()),
     }
 }
