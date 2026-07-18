@@ -3,10 +3,19 @@ name = "bundle-cat"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "bundle-cat"
+path = "src/bin/bundle_cat.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
 [dependencies]
 anyhow = "1.0"
 bstr = "1.12"
-clap = { version = "4.6", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"], optional = true }
 glob = "0.3"
 jiff = { version = "0.2", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
