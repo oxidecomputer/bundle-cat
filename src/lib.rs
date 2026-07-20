@@ -21,6 +21,10 @@ use std::process::{Command, Stdio};
 use std::str;
 use std::thread;
 
+mod source;
+
+pub use source::{BundleFileMetadata, BundleSource, DirectoryBundleSource, ZipBundleSource};
+
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
 
