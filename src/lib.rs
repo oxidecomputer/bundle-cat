@@ -897,7 +897,7 @@ mod tests {
     use zip::write::{SimpleFileOptions, ZipWriter};
     use zip::{CompressionMethod, DateTime};
 
-    use std::fs;
+    use std::fs::{self, FileTimes};
     use std::io::Cursor;
     use std::rc::Rc;
     use std::str::FromStr;
@@ -1235,6 +1235,103 @@ mod tests {
         }
 
         zip.finish_into_readable().unwrap()
+    }
+
+    fn build_directory(root: &Path) {
+        for file in zip_files() {
+            let path = root.join(file.name);
+            if let Some(contents) = file.contents {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, [contents.as_bytes(), b"\n"].concat()).unwrap();
+
+                let civil =
+                    jiff::civil::DateTime::try_from(file.mtime.unwrap_or_default()).unwrap();
+                let timestamp = civil.to_zoned(jiff::tz::TimeZone::UTC).unwrap().timestamp();
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(FileTimes::new().set_modified(timestamp.into()))
+                    .unwrap();
+            } else {
+                fs::create_dir_all(path).unwrap();
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct RenderedBundle {
+        sleds: Vec<u8>,
+        services: Vec<u8>,
+        zones: Vec<u8>,
+        logs: Vec<u8>,
+        logs_after: Vec<u8>,
+        ereports_list: Vec<u8>,
+        ereports_show: Vec<u8>,
+    }
+
+    fn render_bundle(bundle: &Bundle<Box<dyn BundleSource>>) -> RenderedBundle {
+        let mut rendered = RenderedBundle {
+            sleds: Vec::new(),
+            services: Vec::new(),
+            zones: Vec::new(),
+            logs: Vec::new(),
+            logs_after: Vec::new(),
+            ereports_list: Vec::new(),
+            ereports_show: Vec::new(),
+        };
+
+        bundle.sleds(&mut rendered.sleds).unwrap();
+        bundle.services(&[], &mut rendered.services).unwrap();
+        bundle.zones(&[], &mut rendered.zones).unwrap();
+        bundle
+            .logs(
+                LogFilter::default(),
+                TimeRange::default(),
+                LogOutput::default(),
+                &mut rendered.logs,
+            )
+            .unwrap();
+        bundle
+            .logs(
+                LogFilter::default(),
+                TimeRange {
+                    after: Some("2025-09-24T06:00:00Z".parse().unwrap()),
+                    ..Default::default()
+                },
+                LogOutput::default(),
+                &mut rendered.logs_after,
+            )
+            .unwrap();
+        bundle
+            .ereports_list(ComponentInfo::default(), &mut rendered.ereports_list)
+            .unwrap();
+        bundle
+            .ereports_show(ComponentInfo::default(), false, &mut rendered.ereports_show)
+            .unwrap();
+
+        rendered
+    }
+
+    #[test]
+    fn zip_and_directory_sources_have_matching_text_output() {
+        let mut buf = Vec::new();
+        drop(build_zip(&mut buf));
+        let zip_source: Box<dyn BundleSource> = Box::new(
+            ZipBundleSource::from_archive(ZipArchive::new(Cursor::new(buf)).unwrap()).unwrap(),
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        build_directory(temp.path());
+        let directory_source: Box<dyn BundleSource> =
+            Box::new(DirectoryBundleSource::open(temp.path()).unwrap());
+
+        let zip_bundle = Bundle::from_source(zip_source).unwrap();
+        let directory_bundle = Bundle::from_source(directory_source).unwrap();
+
+        let zip_rendered = render_bundle(&zip_bundle);
+        let directory_rendered = render_bundle(&directory_bundle);
+        assert_eq!(zip_rendered, directory_rendered);
     }
 
     #[test]
