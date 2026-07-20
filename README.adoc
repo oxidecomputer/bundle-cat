@@ -2,6 +2,63 @@
 
 A small tool to find and print files from support bundles.
 
+== Library use
+
+The package is named `bundle-cat` and is imported in Rust as `bundle_cat`.
+Its default feature set includes `cli`. Library-only consumers can disable
+default features to omit the optional `clap` dependency and binary:
+
+[source,toml]
+----
+[dependencies]
+anyhow = "1.0"
+bundle-cat = { git = "https://github.com/oxidecomputer/bundle-cat", default-features = false }
+zip = "8.2"
+----
+
+Construct a bundle from a ZIP archive:
+
+[source,rust]
+----
+use bundle_cat::Bundle;
+use std::fs::File;
+use std::io::BufReader;
+use zip::ZipArchive;
+
+let reader = BufReader::new(File::open("support-bundle.zip")?);
+let archive = ZipArchive::new(reader)?;
+let bundle = Bundle::from_archive(archive)?;
+----
+
+Or open an unpacked support bundle directory:
+
+[source,rust]
+----
+use bundle_cat::Bundle;
+
+let bundle = Bundle::open_dir("unpacked-support-bundle")?;
+----
+
+Custom synchronous backends implement the object-safe `BundleSource` trait.
+They provide owned relative UTF-8 names, files supporting sequential `Read`,
+and optional length and modification-time metadata. For example, a boxed
+custom source can be consumed while listing sleds:
+
+[source,rust]
+----
+use anyhow::Result;
+use bundle_cat::{Bundle, BundleSource};
+
+fn list_sleds(source: Box<dyn BundleSource>) -> Result<()> {
+    let bundle = Bundle::from_source(source)?;
+    bundle.sleds(std::io::stdout())?;
+    Ok(())
+}
+----
+
+The CLI remains ZIP-only; directory and custom sources are library APIs. ZIP
+lookup is name-based, so duplicate ZIP entry names are unsupported.
+
 == Usage
 
 List sleds in the bundle:
