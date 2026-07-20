@@ -592,14 +592,15 @@ impl BundleInfo {
             if is_log_file
                 && let (Some(sled_uuid), Some(zone), Some(service), Some(descendant)) =
                     (splits.get(3), splits.get(5), splits.get(6), splits.get(7))
+                && !sled_uuid.is_empty()
+                && !zone.is_empty()
+                && !service.is_empty()
                 && !descendant.is_empty()
             {
-                if !service.is_empty() {
-                    sled_zones
-                        .entry((*sled_uuid).to_string())
-                        .or_default()
-                        .insert((*zone).to_string());
-                }
+                sled_zones
+                    .entry((*sled_uuid).to_string())
+                    .or_default()
+                    .insert((*zone).to_string());
                 sled_services
                     .entry((*sled_uuid).to_string())
                     .or_default()
@@ -1789,6 +1790,27 @@ mod tests {
     }
 
     #[test]
+    fn empty_inventory_path_components_do_not_infer_zone_or_service() {
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        for path in ["logs//service/file", "logs/zone//file"] {
+            source.files.insert(
+                format!("rack/{TEST_RACK}/sled/{TEST_SLED}/{path}"),
+                Vec::new(),
+            );
+        }
+
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut zones = Vec::new();
+        let mut services = Vec::new();
+        bundle.zones(&[], &mut zones).unwrap();
+        bundle.services(&[], &mut services).unwrap();
+
+        assert!(zones.is_empty());
+        assert!(services.is_empty());
+    }
+
+    #[test]
     fn bundle_open_dir_reads_inventory() {
         let temp = tempfile::tempdir().unwrap();
         let source = MemorySource::bundle();
@@ -1841,6 +1863,68 @@ mod tests {
             out,
             b"{\"time\":\"2025-09-24T06:30:00Z\",\"msg\":\"complete\"}\nsecond line\n"
         );
+    }
+
+    #[test]
+    fn log_timestamp_fallbacks_follow_content_filename_metadata_precedence() {
+        let cases = [
+            (
+                "content timestamp",
+                "test.log.1749945600",
+                b"{\"time\":\"2024-06-15T00:00:00Z\"}\n".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                "filename timestamp",
+                "test.log.1718409600",
+                b"no timestamp\n".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                "metadata timestamp",
+                "test.log",
+                b"selected exactly once\n".as_slice(),
+                b"selected exactly once\n".as_slice(),
+            ),
+        ];
+
+        for (label, file_name, contents, expected) in cases {
+            let sled_path = format!("rack/{TEST_RACK}/sled/{TEST_SLED}/sled.txt");
+            let log_path = format!("rack/{TEST_RACK}/sled/{TEST_SLED}/logs/zone/test/{file_name}");
+            let source = MemorySource {
+                files: BTreeMap::from([
+                    (
+                        sled_path,
+                        br#"Sled { is_scrimlet: false, serial_number: "BRM99990001" }"#.to_vec(),
+                    ),
+                    (log_path, contents.to_vec()),
+                ]),
+                modified: Some("2025-06-15T00:00:00Z".parse().unwrap()),
+                ..Default::default()
+            };
+            let bundle = Bundle::from_source(source).unwrap();
+            let mut out = Vec::new();
+
+            bundle
+                .logs(
+                    LogFilter {
+                        service: &[Pattern::new("test").unwrap()],
+                        ..Default::default()
+                    },
+                    TimeRange {
+                        after: Some("2025-01-01T00:00:00Z".parse().unwrap()),
+                        before: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+                    },
+                    LogOutput {
+                        no_header: true,
+                        ..Default::default()
+                    },
+                    &mut out,
+                )
+                .unwrap();
+
+            assert_eq!(out, expected, "{label}");
+        }
     }
 
     #[test]

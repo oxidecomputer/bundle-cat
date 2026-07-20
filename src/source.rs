@@ -252,6 +252,19 @@ mod tests {
     }
 
     #[test]
+    fn zip_source_lists_files_in_archive_order() {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for name in ["z.log", "a.log"] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(name.as_bytes()).unwrap();
+        }
+        let source = ZipBundleSource::new(zip.finish().unwrap()).unwrap();
+
+        assert_eq!(source.file_names(), ["z.log", "a.log"]);
+    }
+
+    #[test]
     fn zip_source_returns_normalized_metadata() {
         let mut source = zip_source();
         let metadata = source.metadata(FILE_NAME).unwrap();
