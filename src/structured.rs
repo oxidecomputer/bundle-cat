@@ -15,7 +15,10 @@ pub struct SledTxtInfo {
 
 /// Parses the serial number and scrimlet flag from `sled.txt` contents.
 ///
-/// Returns `None` when the input is invalid or does not contain both fields.
+/// The parser requires ` serial_number: "..."` and ` is_scrimlet: true|false,`
+/// fields in the debug-format inventory record. It returns `None` when either
+/// field is absent or malformed; it does not attempt to deserialize the rest
+/// of the record.
 pub fn parse_sled_txt(contents: &str) -> Option<SledTxtInfo> {
     const SERIAL_PREFIX: &str = " serial_number: \"";
     let serial_start = contents.find(SERIAL_PREFIX)? + SERIAL_PREFIX.len();
@@ -46,6 +49,8 @@ pub struct EreportPathInfo {
 }
 
 /// An owned ereport read from a bundle.
+///
+/// Entries may be retained after their callback returns.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EreportEntry {
     /// The bundle-relative ereport path.
@@ -54,7 +59,7 @@ pub struct EreportEntry {
     pub metadata: EreportPathInfo,
     /// The top-level string `class`, when present and valid.
     pub class: Option<String>,
-    /// The unchanged UTF-8 file contents.
+    /// The unchanged UTF-8 file contents, suitable for consumer-selected JSON parsing.
     pub contents: String,
 }
 
@@ -69,7 +74,8 @@ pub struct LogEntry {
     pub service: Option<String>,
     /// The zone parsed from the log path, when present.
     pub zone: Option<String>,
-    /// The best available timestamp from the contents, path, or source metadata.
+    /// The best available timestamp, preferring contents, then a filename
+    /// suffix, then source modification metadata.
     pub timestamp: Option<jiff::Timestamp>,
 }
 

@@ -243,6 +243,13 @@ impl<S: BundleSource> Bundle<S> {
     }
 
     /// Invoke `handler` for each ereport matching the component filters.
+    ///
+    /// Matching paths are processed in source order. Class filters reject only
+    /// entries with a valid top-level string class that does not match; entries
+    /// with a missing, malformed, or non-string class remain included. Each
+    /// callback receives an owned entry after the source borrow is released, so
+    /// it may retain the entry or re-enter this bundle. A callback error stops
+    /// iteration immediately and is returned with the ereport path as context.
     pub fn for_each_ereport<F>(
         &self,
         components: ComponentInfo<'_>,
@@ -520,8 +527,15 @@ impl<S: BundleSource> Bundle<S> {
 
     /// Calls `handler` for every selected log, with metadata and a complete reader.
     ///
-    /// The reader borrows the bundle source. The callback must not re-enter any
-    /// method on this same `Bundle` while that reader is alive.
+    /// Logs are processed in source order. The timestamp is resolved even when
+    /// no time bounds are set, preferring the first valid timestamp in the
+    /// inspected contents, then the filename suffix, then source modification
+    /// metadata. The reader replays the inspected prefix before the remainder,
+    /// so it yields every file byte exactly once; consumers must finish reading
+    /// or copying it before the callback returns. The reader borrows the bundle
+    /// source, so the callback must not re-enter any method on this same
+    /// `Bundle` while it is alive. A callback error stops iteration immediately
+    /// and is returned with the log path as context.
     pub fn for_each_log<F>(
         &self,
         filter: LogFilter<'_>,
@@ -1325,6 +1339,8 @@ mod tests {
         logs_after: Vec<u8>,
         ereports_list: Vec<u8>,
         ereports_show: Vec<u8>,
+        structured_ereports: Vec<EreportEntry>,
+        structured_logs: Vec<(LogEntry, Vec<u8>)>,
     }
 
     fn render_bundle(bundle: &Bundle<Box<dyn BundleSource>>) -> RenderedBundle {
@@ -1336,6 +1352,8 @@ mod tests {
             logs_after: Vec::new(),
             ereports_list: Vec::new(),
             ereports_show: Vec::new(),
+            structured_ereports: Vec::new(),
+            structured_logs: Vec::new(),
         };
 
         bundle.sleds(&mut rendered.sleds).unwrap();
@@ -1366,6 +1384,24 @@ mod tests {
         bundle
             .ereports_show(ComponentInfo::default(), false, &mut rendered.ereports_show)
             .unwrap();
+        bundle
+            .for_each_ereport(ComponentInfo::default(), |entry| {
+                rendered.structured_ereports.push(entry);
+                Ok(())
+            })
+            .unwrap();
+        bundle
+            .for_each_log(
+                LogFilter::default(),
+                TimeRange::default(),
+                |entry, reader| {
+                    let mut contents = Vec::new();
+                    reader.read_to_end(&mut contents)?;
+                    rendered.structured_logs.push((entry, contents));
+                    Ok(())
+                },
+            )
+            .unwrap();
 
         rendered
     }
@@ -1388,6 +1424,8 @@ mod tests {
 
         let zip_rendered = render_bundle(&zip_bundle);
         let directory_rendered = render_bundle(&directory_bundle);
+        assert!(!zip_rendered.structured_ereports.is_empty());
+        assert!(!zip_rendered.structured_logs.is_empty());
         assert_eq!(zip_rendered, directory_rendered);
     }
 
@@ -1833,7 +1871,6 @@ mod tests {
                     part: &parts,
                     serial: &serials,
                     class: &classes,
-                    ..Default::default()
                 },
                 |entry| {
                     paths.push(entry.path);
