@@ -27,11 +27,13 @@ mod structured;
 pub use source::{BundleFileMetadata, BundleSource, DirectoryBundleSource, ZipBundleSource};
 use structured::parse_ereport_class;
 pub use structured::{
-    EreportEntry, EreportPathInfo, SledTxtInfo, parse_ereport_path, parse_sled_txt,
+    EreportEntry, EreportPathInfo, LogEntry, SledTxtInfo, parse_ereport_path, parse_sled_txt,
 };
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
+
+const TIME_CHECK_MAX: u64 = 1 << 16;
 
 /// Glob-pattern filters selecting ereports by hardware component.
 #[derive(Clone, Copy, Default, Debug)]
@@ -209,6 +211,28 @@ impl Bundle<DirectoryBundleSource> {
 }
 
 impl<S: BundleSource> Bundle<S> {
+    fn matching_log_files(&self, filter: LogFilter<'_>) -> Vec<LogFile> {
+        self.source
+            .borrow()
+            .file_names()
+            .into_iter()
+            .filter_map(|path| {
+                let log = LogFile::from_path(&path)?;
+                let sled = self
+                    .info
+                    .sleds
+                    .get(&log.sled_uuid)
+                    .expect("BUG: UUID was not found in collected sled info");
+
+                (sled.matches_patterns(filter.sled)
+                    && log.matches_services(filter.service)
+                    && log.matches_zones(filter.zone)
+                    && log.matches_paths(filter.path))
+                .then_some(log)
+            })
+            .collect()
+    }
+
     /// Construct a `Bundle` from a bundle source.
     pub fn from_source(mut source: S) -> Result<Self> {
         let info = BundleInfo::from_source(&mut source)?;
@@ -390,43 +414,21 @@ impl<S: BundleSource> Bundle<S> {
         output: LogOutput<'_>,
         mut out: W,
     ) -> Result<()> {
+        let matching_files = self.matching_log_files(filter);
         let source = &mut self.source.borrow_mut();
-        let matching_files: Vec<_> = source
-            .file_names()
-            .into_iter()
-            .filter_map(|path| {
-                let log_file = LogFile::from_path(&path)?;
 
-                let sled_info = self
-                    .info
-                    .sleds
-                    .get(&log_file.sled_uuid)
-                    .expect("BUG: UUID was not found in collected sled info");
-
-                if sled_info.matches_patterns(filter.sled)
-                    && log_file.matches_services(filter.service)
-                    && log_file.matches_zones(filter.zone)
-                    && log_file.matches_paths(filter.path)
-                {
-                    Some((path, log_file))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for (path, log) in matching_files {
+        for log in matching_files {
+            let path = &log.path;
             let metadata = time
                 .is_set()
-                .then(|| source.metadata(&path))
+                .then(|| source.metadata(path))
                 .transpose()
                 .with_context(|| format!("failed to read metadata for {path}"))?;
             let mut file = source
-                .open_file(&path)
+                .open_file(path)
                 .with_context(|| format!("failed to open {path}"))?;
 
             let time_check_buf = if time.is_set() {
-                const TIME_CHECK_MAX: u64 = 1 << 16;
                 let mut tc = Vec::with_capacity(
                     metadata
                         .as_ref()
@@ -446,12 +448,7 @@ impl<S: BundleSource> Bundle<S> {
                 // 3. Check the file's mtime in the zip, which will be available with R17.
                 // In all cases ignore times from before 2001, and skip any file where we cannot find a
                 // valid time.
-                let ts = read_timestamp_from_contents(&tc)
-                    .or_else(|| {
-                        let ts = log.timestamp?;
-                        Timestamp::from_second(ts).ok()
-                    })
-                    .or_else(|| metadata.as_ref()?.modified);
+                let ts = effective_log_timestamp(&log, &tc, metadata.as_ref().unwrap());
 
                 if !ts.is_some_and(|ts| time.contains(ts)) {
                     continue;
@@ -518,6 +515,56 @@ impl<S: BundleSource> Bundle<S> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Calls `handler` for every selected log, with metadata and a complete reader.
+    ///
+    /// The reader borrows the bundle source. The callback must not re-enter any
+    /// method on this same `Bundle` while that reader is alive.
+    pub fn for_each_log<F>(
+        &self,
+        filter: LogFilter<'_>,
+        time: TimeRange,
+        mut handler: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(LogEntry, &mut dyn std::io::Read) -> anyhow::Result<()>,
+    {
+        for log in self.matching_log_files(filter) {
+            let path = &log.path;
+            let metadata = self
+                .source
+                .borrow_mut()
+                .metadata(path)
+                .with_context(|| format!("failed to read metadata for {path}"))?;
+            let mut source = self.source.borrow_mut();
+            let mut file = source
+                .open_file(path)
+                .with_context(|| format!("failed to open {path}"))?;
+            let mut inspected = Vec::with_capacity(
+                metadata.len.unwrap_or(TIME_CHECK_MAX).min(TIME_CHECK_MAX) as usize,
+            );
+            file.by_ref()
+                .take(TIME_CHECK_MAX)
+                .read_to_end(&mut inspected)
+                .with_context(|| format!("failed to read file {path}"))?;
+            let timestamp = effective_log_timestamp(&log, &inspected, &metadata);
+            if time.is_set() && !timestamp.is_some_and(|timestamp| time.contains(timestamp)) {
+                continue;
+            }
+
+            let entry = LogEntry {
+                path: log.path.clone(),
+                sled_uuid: log.sled_uuid.clone(),
+                service: log.service.clone(),
+                zone: log.zone.clone(),
+                timestamp,
+            };
+            let mut complete = io::Cursor::new(inspected).chain(file);
+            handler(entry, &mut complete)
+                .with_context(|| format!("log callback failed for {path}"))?;
+        }
         Ok(())
     }
 
@@ -887,6 +934,16 @@ fn read_timestamp_from_contents(buf: &[u8]) -> Option<Timestamp> {
     None
 }
 
+fn effective_log_timestamp(
+    log: &LogFile,
+    inspected: &[u8],
+    metadata: &BundleFileMetadata,
+) -> Option<Timestamp> {
+    read_timestamp_from_contents(inspected)
+        .or_else(|| Timestamp::from_second(log.timestamp?).ok())
+        .or(metadata.modified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,6 +957,7 @@ mod tests {
     use std::io::Cursor;
     use std::rc::Rc;
     use std::str::FromStr;
+    use std::sync::OnceLock;
 
     const TEST_RACK: &str = "34261901-b550-451c-9bd0-3926bb29c40d";
     const TEST_SLED: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -1930,6 +1988,205 @@ mod tests {
         let mut out = Vec::new();
         bundle.services(&[], &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "sled-agent\n");
+    }
+
+    fn structured_log_path(file_name: &str) -> String {
+        format!("rack/{TEST_RACK}/sled/{TEST_SLED}/logs/global/test/current/{file_name}")
+    }
+
+    fn structured_log_filter() -> LogFilter<'static> {
+        static SERVICES: OnceLock<[Pattern; 1]> = OnceLock::new();
+        LogFilter {
+            service: SERVICES.get_or_init(|| [Pattern::new("test").unwrap()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn for_each_log_uses_source_order_and_metadata_before_open_without_bounds() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        let paths = [structured_log_path("a.log"), structured_log_path("b.log")];
+        for path in &paths {
+            source.files.insert(path.clone(), path.as_bytes().to_vec());
+        }
+        source.events = Some(Rc::clone(&events));
+        let bundle = Bundle::from_source(source).unwrap();
+        events.borrow_mut().clear();
+        let mut seen = Vec::new();
+
+        bundle
+            .for_each_log(
+                structured_log_filter(),
+                TimeRange::default(),
+                |entry, reader| {
+                    let mut contents = Vec::new();
+                    reader.read_to_end(&mut contents)?;
+                    seen.push((entry, contents));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            seen.iter()
+                .map(|(entry, _)| &entry.path)
+                .collect::<Vec<_>>(),
+            [&paths[0], &paths[1]]
+        );
+        assert_eq!(seen[0].1, paths[0].as_bytes());
+        assert_eq!(seen[1].1, paths[1].as_bytes());
+        assert_eq!(
+            *events.borrow(),
+            [
+                format!("metadata:{}", paths[0]),
+                format!("open:{}", paths[0]),
+                format!("metadata:{}", paths[1]),
+                format!("open:{}", paths[1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn for_each_log_resolves_timestamps_and_filters_missing_timestamps() {
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        source.modified = Some("2025-03-01T00:00:00Z".parse().unwrap());
+        for (name, contents) in [
+            (
+                "a.log.1738368000",
+                b"{\"time\":\"2025-01-01T00:00:00Z\"}\n".as_slice(),
+            ),
+            ("b.log.1738454400", b"no content timestamp\n".as_slice()),
+            ("c.log", b"metadata fallback\n".as_slice()),
+        ] {
+            source
+                .files
+                .insert(structured_log_path(name), contents.to_vec());
+        }
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut timestamps = Vec::new();
+        bundle
+            .for_each_log(structured_log_filter(), TimeRange::default(), |entry, _| {
+                timestamps.push(entry.timestamp);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            timestamps,
+            [
+                Some("2025-01-01T00:00:00Z".parse().unwrap()),
+                Some(Timestamp::from_second(1738454400).unwrap()),
+                Some("2025-03-01T00:00:00Z".parse().unwrap()),
+            ]
+        );
+
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        source
+            .files
+            .insert(structured_log_path("missing.log"), b"none\n".to_vec());
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut unbounded = Vec::new();
+        bundle
+            .for_each_log(structured_log_filter(), TimeRange::default(), |entry, _| {
+                unbounded.push(entry.timestamp);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(unbounded, [None]);
+        let mut bounded_calls = 0;
+        bundle
+            .for_each_log(
+                structured_log_filter(),
+                TimeRange {
+                    after: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+                    before: None,
+                },
+                |_, _| {
+                    bounded_calls += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(bounded_calls, 0);
+    }
+
+    #[test]
+    fn for_each_log_replays_large_prefix_and_discards_partial_reader() {
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        let first_path = structured_log_path("a.log");
+        let second_path = structured_log_path("b.log");
+        let mut first = b"{\"time\":\"2025-01-01T00:00:00Z\"}\n".to_vec();
+        first.resize(65_536, b'x');
+        first.extend_from_slice(b"distinct tail beyond inspection boundary");
+        let second = b"second complete file".to_vec();
+        source.files.insert(first_path, first.clone());
+        source.files.insert(second_path, second.clone());
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut calls = 0;
+
+        bundle
+            .for_each_log(
+                structured_log_filter(),
+                TimeRange::default(),
+                |_, reader| {
+                    calls += 1;
+                    if calls == 1 {
+                        let mut partial = [0; 7];
+                        reader.read_exact(&mut partial)?;
+                        assert_eq!(&partial, &first[..7]);
+                    } else {
+                        let mut contents = Vec::new();
+                        reader.read_to_end(&mut contents)?;
+                        assert_eq!(contents, second);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, 2);
+
+        let mut complete = Vec::new();
+        bundle
+            .for_each_log(
+                LogFilter {
+                    service: &[Pattern::new("test").unwrap()],
+                    path: &[Pattern::new("*a.log").unwrap()],
+                    ..Default::default()
+                },
+                TimeRange::default(),
+                |_, reader| {
+                    reader.read_to_end(&mut complete)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(complete, first);
+    }
+
+    #[test]
+    fn for_each_log_stops_and_contextualizes_callback_errors() {
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        let first = structured_log_path("a.log");
+        source.files.insert(first.clone(), Vec::new());
+        source
+            .files
+            .insert(structured_log_path("b.log"), Vec::new());
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut calls = 0;
+        let error = bundle
+            .for_each_log(structured_log_filter(), TimeRange::default(), |_, _| {
+                calls += 1;
+                anyhow::bail!("handler failed")
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains(&first));
+        assert!(format!("{error:#}").contains("handler failed"));
     }
 
     #[test]

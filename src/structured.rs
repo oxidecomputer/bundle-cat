@@ -58,6 +58,21 @@ pub struct EreportEntry {
     pub contents: String,
 }
 
+/// Metadata for a log passed to a structured log callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogEntry {
+    /// The bundle-relative log path.
+    pub path: String,
+    /// The UUID of the sled that produced the log.
+    pub sled_uuid: String,
+    /// The service parsed from the log path, when present.
+    pub service: Option<String>,
+    /// The zone parsed from the log path, when present.
+    pub zone: Option<String>,
+    /// The best available timestamp from the contents, path, or source metadata.
+    pub timestamp: Option<jiff::Timestamp>,
+}
+
 pub(crate) fn parse_ereport_class(contents: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(contents)
         .ok()?
