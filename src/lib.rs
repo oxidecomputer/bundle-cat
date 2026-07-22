@@ -22,8 +22,10 @@ use std::str;
 use std::thread;
 
 mod source;
+mod structured;
 
 pub use source::{BundleFileMetadata, BundleSource, DirectoryBundleSource, ZipBundleSource};
+pub use structured::{EreportPathInfo, SledTxtInfo, parse_ereport_path, parse_sled_txt};
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
@@ -221,7 +223,7 @@ impl<S: BundleSource> Bundle<S> {
             .file_names()
             .into_iter()
             .filter_map(|path| {
-                let ereport = Ereport::from_path(&path)?;
+                let ereport = parse_ereport_path(&path)?;
 
                 if matches_patterns(components.part, &ereport.part)
                     && matches_patterns(components.serial, &ereport.serial)
@@ -283,7 +285,7 @@ impl<S: BundleSource> Bundle<S> {
             .file_names()
             .into_iter()
             .filter_map(|path| {
-                let ereport = Ereport::from_path(&path)?;
+                let ereport = parse_ereport_path(&path)?;
 
                 if matches_patterns(components.part, &ereport.part)
                     && matches_patterns(components.serial, &ereport.serial)
@@ -621,7 +623,10 @@ impl BundleInfo {
                 .open_file(&path)
                 .with_context(|| format!("failed to open {path}"))?;
             let contents = read_file_to_string(&mut file, &path)?;
-            let (serial, is_scrimlet) = read_sled_serial(&contents)
+            let SledTxtInfo {
+                serial,
+                is_scrimlet,
+            } = parse_sled_txt(&contents)
                 .ok_or_else(|| anyhow::anyhow!("failed to parse sled serial from {path}"))?;
 
             // UNWRAP: We've confirmed above that the split length is five.
@@ -697,19 +702,6 @@ fn read_file_to_string(file: &mut dyn Read, path: &str) -> Result<String> {
     String::from_utf8(buf).with_context(|| format!("contents of {path} were not valid UTF-8"))
 }
 
-fn read_sled_serial(sled_info: &str) -> Option<(String, bool)> {
-    const SERIAL_PREFIX: &str = " serial_number: \"";
-    let serial_start = sled_info.find(SERIAL_PREFIX)? + SERIAL_PREFIX.len();
-    let serial_end = serial_start + sled_info[serial_start..].find("\"")?;
-
-    const SCRIMLET_PREFIX: &str = " is_scrimlet: ";
-    let scrimlet_start = sled_info.find(SCRIMLET_PREFIX)? + SCRIMLET_PREFIX.len();
-    let scrimlet_end = scrimlet_start + sled_info[scrimlet_start..].find(",")?;
-    let is_scrimlet = sled_info[scrimlet_start..scrimlet_end].parse().ok()?;
-
-    Some((sled_info[serial_start..serial_end].to_string(), is_scrimlet))
-}
-
 #[derive(PartialEq, Debug)]
 struct SledInfo {
     uuid: String,
@@ -743,44 +735,6 @@ impl SledInfo {
             } else {
                 p.matches(&self.uuid) || p.matches(&self.serial)
             }
-        })
-    }
-}
-
-#[derive(PartialEq, Debug)]
-struct Ereport {
-    part: String,
-    serial: String,
-    restart_id: String,
-    ena: u64,
-}
-
-impl Ereport {
-    fn from_path(path: &str) -> Option<Self> {
-        // ereports/{part-number}-{serial_number}/{restart_id}/{ENA}.json
-        if !path.starts_with("ereports") {
-            return None;
-        }
-
-        let splits: Vec<_> = path.split('/').collect();
-        if splits.len() < 4 {
-            return None;
-        }
-
-        // Part numbers contain a '-', but serials do not, at least currently.
-        // Split from the right to ensure we're finding the boundary between the two.
-        let (part, serial) = splits[1].rsplit_once('-')?;
-        let restart_id = splits[2].to_string();
-        let file_name = splits[3];
-        let ena = file_name
-            .strip_suffix(".json")
-            .and_then(|n| n.parse::<u64>().ok())?;
-
-        Some(Ereport {
-            part: part.to_string(),
-            serial: serial.to_string(),
-            restart_id,
-            ena,
         })
     }
 }
@@ -1753,12 +1707,18 @@ mod tests {
         const SLED_INFO: &str = r#"Sled { identity: SledIdentity { id: f1e02cab-ef5a-4405-974c-f8cf7df7d4ea, time_created: 2025-05-08T20:31:06.943606Z, time_modified: 2025-05-08T20:31:06.943606Z }, time_deleted: None, rcgen: Generation(Generation(21)), rack_id: 34261901-b550-451c-9bd0-3926bb29c40d, is_scrimlet: false, serial_number: "BRM03250001", part_number: "913-0000019", revision: SqlU32(14), usable_hardware_threads: SqlU32(128), usable_physical_ram: ByteCount(ByteCount(2186120527872)), reservoir_size: ByteCount(ByteCount(1790577737728)), ip: fd00:1122:3344:102::1, port: SqlU16(12345), last_used_address: fd00:1122:3344:102::1:3, policy: InService, state: Active, sled_agent_gen: Generation(Generation(1)), repo_depot_port: SqlU16(12348) }"#;
 
         assert_eq!(
-            read_sled_serial(SCRIMLET_INFO),
-            Some(("BRM03250000".to_string(), true))
+            parse_sled_txt(SCRIMLET_INFO),
+            Some(SledTxtInfo {
+                serial: "BRM03250000".to_string(),
+                is_scrimlet: true,
+            })
         );
         assert_eq!(
-            read_sled_serial(SLED_INFO),
-            Some(("BRM03250001".to_string(), false))
+            parse_sled_txt(SLED_INFO),
+            Some(SledTxtInfo {
+                serial: "BRM03250001".to_string(),
+                is_scrimlet: false,
+            })
         );
     }
 
