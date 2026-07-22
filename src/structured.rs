@@ -45,6 +45,28 @@ pub struct EreportPathInfo {
     pub ena: u64,
 }
 
+/// An owned ereport read from a bundle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EreportEntry {
+    /// The bundle-relative ereport path.
+    pub path: String,
+    /// Metadata parsed from the ereport path.
+    pub metadata: EreportPathInfo,
+    /// The top-level string `class`, when present and valid.
+    pub class: Option<String>,
+    /// The unchanged UTF-8 file contents.
+    pub contents: String,
+}
+
+pub(crate) fn parse_ereport_class(contents: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(contents)
+        .ok()?
+        .as_object()?
+        .get("class")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// Parses an ereport path with the strict grammar
 /// `ereports/{part}-{serial}/{restart_id}/{decimal_ena}.json`.
 ///

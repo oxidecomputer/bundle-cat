@@ -25,7 +25,10 @@ mod source;
 mod structured;
 
 pub use source::{BundleFileMetadata, BundleSource, DirectoryBundleSource, ZipBundleSource};
-pub use structured::{EreportPathInfo, SledTxtInfo, parse_ereport_path, parse_sled_txt};
+use structured::parse_ereport_class;
+pub use structured::{
+    EreportEntry, EreportPathInfo, SledTxtInfo, parse_ereport_path, parse_sled_txt,
+};
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
@@ -215,6 +218,55 @@ impl<S: BundleSource> Bundle<S> {
         })
     }
 
+    /// Invoke `handler` for each ereport matching the component filters.
+    pub fn for_each_ereport<F>(
+        &self,
+        components: ComponentInfo<'_>,
+        mut handler: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(EreportEntry) -> anyhow::Result<()>,
+    {
+        let candidates: Vec<_> = self
+            .source
+            .borrow()
+            .file_names()
+            .into_iter()
+            .filter_map(|path| {
+                let metadata = parse_ereport_path(&path)?;
+                (matches_patterns(components.part, &metadata.part)
+                    && matches_patterns(components.serial, &metadata.serial))
+                .then_some((path, metadata))
+            })
+            .collect();
+
+        for (path, metadata) in candidates {
+            let contents = {
+                let source = &mut self.source.borrow_mut();
+                let mut file = source
+                    .open_file(&path)
+                    .with_context(|| format!("failed to open {path}"))?;
+                read_file_to_string(&mut file, &path)?
+            };
+            let class = parse_ereport_class(&contents);
+            if let Some(class) = class.as_deref()
+                && !matches_patterns(components.class, class)
+            {
+                continue;
+            }
+
+            handler(EreportEntry {
+                path: path.clone(),
+                metadata,
+                class,
+                contents,
+            })
+            .with_context(|| format!("ereport handler failed for {path}"))?;
+        }
+
+        Ok(())
+    }
+
     /// List all ereports in the archive.
     pub fn ereports_list<W: Write>(&self, components: ComponentInfo<'_>, mut out: W) -> Result<()> {
         let source = &mut self.source.borrow_mut();
@@ -252,9 +304,9 @@ impl<S: BundleSource> Bundle<S> {
                 .open_file(&path)
                 .with_context(|| format!("failed to open {path}"))?;
             let contents = read_file_to_string(&mut file, &path)?;
-            let ereport_class = read_ereport_class(&contents);
+            let ereport_class = parse_ereport_class(&contents);
 
-            if let Some(ereport_class) = ereport_class
+            if let Some(ereport_class) = ereport_class.as_deref()
                 && !matches_patterns(components.class, ereport_class)
             {
                 continue;
@@ -266,7 +318,7 @@ impl<S: BundleSource> Bundle<S> {
                 ereport.serial,
                 ereport.restart_id,
                 ereport.ena,
-                ereport_class.unwrap_or("unknown"),
+                ereport_class.as_deref().unwrap_or("unknown"),
             )?;
         }
 
@@ -304,8 +356,8 @@ impl<S: BundleSource> Bundle<S> {
 
             let contents = read_file_to_string(&mut file, &path)?;
 
-            if let Some(ereport_class) = read_ereport_class(&contents)
-                && !matches_patterns(components.class, ereport_class)
+            if let Some(ereport_class) = parse_ereport_class(&contents)
+                && !matches_patterns(components.class, &ereport_class)
             {
                 continue;
             }
@@ -745,14 +797,6 @@ fn matches_patterns(patterns: &[Pattern], s: &str) -> bool {
     }
 
     patterns.iter().any(|p| p.matches(s))
-}
-
-fn read_ereport_class(ereport_raw: &str) -> Option<&str> {
-    const CLASS_PREFIX: &str = "\"class\":\"";
-    let class_start = ereport_raw.find(CLASS_PREFIX)? + CLASS_PREFIX.len();
-    let class_end = class_start + ereport_raw[class_start..].find("\"")?;
-
-    Some(&ereport_raw[class_start..class_end])
 }
 
 /// Minimal struct to grab the timestamp from a JSON log event.
@@ -1646,12 +1690,170 @@ mod tests {
     }
 
     #[test]
-    fn test_read_ereport_class() {
+    fn test_parse_ereport_class_recognizes_spaced_json() {
         let ereport_str = &zip_files()[3].contents.clone().unwrap();
         assert_eq!(
-            read_ereport_class(ereport_str),
-            Some("ereport.io.pci.device")
+            parse_ereport_class(ereport_str),
+            Some("ereport.io.pci.device".to_string())
         );
+    }
+
+    fn structured_ereport_source() -> (MemorySource, Rc<RefCell<Vec<String>>>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut source = MemorySource::bundle();
+        source.events = Some(Rc::clone(&events));
+        for (path, contents) in [
+            (
+                "ereports/parta-seriala/restart-a/1.json",
+                r#"{"class":"ereport.compact","value":1}"#,
+            ),
+            (
+                "ereports/partb-serialb/restart-b/2.json",
+                "{\n  \"class\": \"ereport.spaced\",\n  \"value\": 2\n}",
+            ),
+            ("ereports/partc-serialc/restart-c/3.json", r#"{"value":3}"#),
+            ("ereports/partd-seriald/restart-d/4.json", r#"{"class":4}"#),
+            ("ereports/parte-seriale/restart-e/5.json", "not json"),
+        ] {
+            source
+                .files
+                .insert(path.to_string(), contents.as_bytes().to_vec());
+        }
+        (source, events)
+    }
+
+    #[test]
+    fn for_each_ereport_returns_owned_entries_in_source_order() {
+        let (source, _) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut entries = Vec::new();
+
+        bundle
+            .for_each_ereport(ComponentInfo::default(), |entry| {
+                entries.push(entry);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].metadata.ena, 1);
+        assert_eq!(entries[0].class.as_deref(), Some("ereport.compact"));
+        assert_eq!(entries[1].class.as_deref(), Some("ereport.spaced"));
+        assert_eq!(
+            entries[1].contents,
+            "{\n  \"class\": \"ereport.spaced\",\n  \"value\": 2\n}"
+        );
+        assert_eq!(entries[2].class, None);
+        assert_eq!(entries[3].class, None);
+        assert_eq!(entries[4].class, None);
+        assert_eq!(entries[4].path, "ereports/parte-seriale/restart-e/5.json");
+    }
+
+    #[test]
+    fn for_each_ereport_filters_paths_before_opening_and_keeps_classless_entries() {
+        let (source, events) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+        events.borrow_mut().clear();
+        let mut paths = Vec::new();
+        let parts = [
+            Pattern::from_str("parta").unwrap(),
+            Pattern::from_str("partc").unwrap(),
+            Pattern::from_str("partd").unwrap(),
+            Pattern::from_str("parte").unwrap(),
+        ];
+        let serials = [
+            Pattern::from_str("seriala").unwrap(),
+            Pattern::from_str("serialc").unwrap(),
+            Pattern::from_str("seriald").unwrap(),
+            Pattern::from_str("seriale").unwrap(),
+        ];
+        let classes = [Pattern::from_str("ereport.other").unwrap()];
+
+        bundle
+            .for_each_ereport(
+                ComponentInfo {
+                    part: &parts,
+                    serial: &serials,
+                    class: &classes,
+                    ..Default::default()
+                },
+                |entry| {
+                    paths.push(entry.path);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            paths,
+            [
+                "ereports/partc-serialc/restart-c/3.json",
+                "ereports/partd-seriald/restart-d/4.json",
+                "ereports/parte-seriale/restart-e/5.json",
+            ]
+        );
+        assert_eq!(
+            *events.borrow(),
+            [
+                "open:ereports/parta-seriala/restart-a/1.json",
+                "open:ereports/partc-serialc/restart-c/3.json",
+                "open:ereports/partd-seriald/restart-d/4.json",
+                "open:ereports/parte-seriale/restart-e/5.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ereports_list_recognizes_spaced_class_syntax() {
+        let (source, _) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+        let classes = [Pattern::from_str("ereport.spaced").unwrap()];
+        let mut out = Vec::new();
+
+        bundle
+            .ereports_list(
+                ComponentInfo {
+                    class: &classes,
+                    ..Default::default()
+                },
+                &mut out,
+            )
+            .unwrap();
+
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("ereport.spaced"));
+        assert!(!out.contains("ereport.compact"));
+    }
+
+    #[test]
+    fn for_each_ereport_stops_and_contextualizes_handler_errors() {
+        let (source, events) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+        events.borrow_mut().clear();
+        let error = bundle
+            .for_each_ereport(ComponentInfo::default(), |_entry| {
+                anyhow::bail!("consumer stopped")
+            })
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("consumer stopped"));
+        assert!(message.contains("ereports/parta-seriala/restart-a/1.json"));
+        assert_eq!(events.borrow().len(), 1);
+    }
+
+    #[test]
+    fn for_each_ereport_releases_source_borrow_before_callback() {
+        let (source, _) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+
+        bundle
+            .for_each_ereport(ComponentInfo::default(), |_entry| {
+                let mut out = Vec::new();
+                bundle.ereports_list(ComponentInfo::default(), &mut out)?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// Build a zip containing a sled with sled.txt but no logs/{zone}/{service} descendants
