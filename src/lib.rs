@@ -22,11 +22,18 @@ use std::str;
 use std::thread;
 
 mod source;
+mod structured;
 
 pub use source::{BundleFileMetadata, BundleSource, DirectoryBundleSource, ZipBundleSource};
+use structured::parse_ereport_class;
+pub use structured::{
+    EreportEntry, EreportPathInfo, LogEntry, SledTxtInfo, parse_ereport_path, parse_sled_txt,
+};
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
+
+const TIME_CHECK_MAX: u64 = 1 << 16;
 
 /// Glob-pattern filters selecting ereports by hardware component.
 #[derive(Clone, Copy, Default, Debug)]
@@ -204,6 +211,28 @@ impl Bundle<DirectoryBundleSource> {
 }
 
 impl<S: BundleSource> Bundle<S> {
+    fn matching_log_files(&self, filter: LogFilter<'_>) -> Vec<LogFile> {
+        self.source
+            .borrow()
+            .file_names()
+            .into_iter()
+            .filter_map(|path| {
+                let log = LogFile::from_path(&path)?;
+                let sled = self
+                    .info
+                    .sleds
+                    .get(&log.sled_uuid)
+                    .expect("BUG: UUID was not found in collected sled info");
+
+                (sled.matches_patterns(filter.sled)
+                    && log.matches_services(filter.service)
+                    && log.matches_zones(filter.zone)
+                    && log.matches_paths(filter.path))
+                .then_some(log)
+            })
+            .collect()
+    }
+
     /// Construct a `Bundle` from a bundle source.
     pub fn from_source(mut source: S) -> Result<Self> {
         let info = BundleInfo::from_source(&mut source)?;
@@ -211,6 +240,62 @@ impl<S: BundleSource> Bundle<S> {
             info,
             source: RefCell::new(source),
         })
+    }
+
+    /// Invoke `handler` for each ereport matching the component filters.
+    ///
+    /// Matching paths are processed in source order. Class filters reject only
+    /// entries with a valid top-level string class that does not match; entries
+    /// with a missing, malformed, or non-string class remain included. Each
+    /// callback receives an owned entry after the source borrow is released, so
+    /// it may retain the entry or re-enter this bundle. A callback error stops
+    /// iteration immediately and is returned with the ereport path as context.
+    pub fn for_each_ereport<F>(
+        &self,
+        components: ComponentInfo<'_>,
+        mut handler: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(EreportEntry) -> anyhow::Result<()>,
+    {
+        let candidates: Vec<_> = self
+            .source
+            .borrow()
+            .file_names()
+            .into_iter()
+            .filter_map(|path| {
+                let metadata = parse_ereport_path(&path)?;
+                (matches_patterns(components.part, &metadata.part)
+                    && matches_patterns(components.serial, &metadata.serial))
+                .then_some((path, metadata))
+            })
+            .collect();
+
+        for (path, metadata) in candidates {
+            let contents = {
+                let source = &mut self.source.borrow_mut();
+                let mut file = source
+                    .open_file(&path)
+                    .with_context(|| format!("failed to open {path}"))?;
+                read_file_to_string(&mut file, &path)?
+            };
+            let class = parse_ereport_class(&contents);
+            if let Some(class) = class.as_deref()
+                && !matches_patterns(components.class, class)
+            {
+                continue;
+            }
+
+            handler(EreportEntry {
+                path: path.clone(),
+                metadata,
+                class,
+                contents,
+            })
+            .with_context(|| format!("ereport handler failed for {path}"))?;
+        }
+
+        Ok(())
     }
 
     /// List all ereports in the archive.
@@ -221,7 +306,7 @@ impl<S: BundleSource> Bundle<S> {
             .file_names()
             .into_iter()
             .filter_map(|path| {
-                let ereport = Ereport::from_path(&path)?;
+                let ereport = parse_ereport_path(&path)?;
 
                 if matches_patterns(components.part, &ereport.part)
                     && matches_patterns(components.serial, &ereport.serial)
@@ -250,9 +335,9 @@ impl<S: BundleSource> Bundle<S> {
                 .open_file(&path)
                 .with_context(|| format!("failed to open {path}"))?;
             let contents = read_file_to_string(&mut file, &path)?;
-            let ereport_class = read_ereport_class(&contents);
+            let ereport_class = parse_ereport_class(&contents);
 
-            if let Some(ereport_class) = ereport_class
+            if let Some(ereport_class) = ereport_class.as_deref()
                 && !matches_patterns(components.class, ereport_class)
             {
                 continue;
@@ -264,7 +349,7 @@ impl<S: BundleSource> Bundle<S> {
                 ereport.serial,
                 ereport.restart_id,
                 ereport.ena,
-                ereport_class.unwrap_or("unknown"),
+                ereport_class.as_deref().unwrap_or("unknown"),
             )?;
         }
 
@@ -283,7 +368,7 @@ impl<S: BundleSource> Bundle<S> {
             .file_names()
             .into_iter()
             .filter_map(|path| {
-                let ereport = Ereport::from_path(&path)?;
+                let ereport = parse_ereport_path(&path)?;
 
                 if matches_patterns(components.part, &ereport.part)
                     && matches_patterns(components.serial, &ereport.serial)
@@ -302,8 +387,8 @@ impl<S: BundleSource> Bundle<S> {
 
             let contents = read_file_to_string(&mut file, &path)?;
 
-            if let Some(ereport_class) = read_ereport_class(&contents)
-                && !matches_patterns(components.class, ereport_class)
+            if let Some(ereport_class) = parse_ereport_class(&contents)
+                && !matches_patterns(components.class, &ereport_class)
             {
                 continue;
             }
@@ -336,43 +421,21 @@ impl<S: BundleSource> Bundle<S> {
         output: LogOutput<'_>,
         mut out: W,
     ) -> Result<()> {
+        let matching_files = self.matching_log_files(filter);
         let source = &mut self.source.borrow_mut();
-        let matching_files: Vec<_> = source
-            .file_names()
-            .into_iter()
-            .filter_map(|path| {
-                let log_file = LogFile::from_path(&path)?;
 
-                let sled_info = self
-                    .info
-                    .sleds
-                    .get(&log_file.sled_uuid)
-                    .expect("BUG: UUID was not found in collected sled info");
-
-                if sled_info.matches_patterns(filter.sled)
-                    && log_file.matches_services(filter.service)
-                    && log_file.matches_zones(filter.zone)
-                    && log_file.matches_paths(filter.path)
-                {
-                    Some((path, log_file))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for (path, log) in matching_files {
+        for log in matching_files {
+            let path = &log.path;
             let metadata = time
                 .is_set()
-                .then(|| source.metadata(&path))
+                .then(|| source.metadata(path))
                 .transpose()
                 .with_context(|| format!("failed to read metadata for {path}"))?;
             let mut file = source
-                .open_file(&path)
+                .open_file(path)
                 .with_context(|| format!("failed to open {path}"))?;
 
             let time_check_buf = if time.is_set() {
-                const TIME_CHECK_MAX: u64 = 1 << 16;
                 let mut tc = Vec::with_capacity(
                     metadata
                         .as_ref()
@@ -392,12 +455,7 @@ impl<S: BundleSource> Bundle<S> {
                 // 3. Check the file's mtime in the zip, which will be available with R17.
                 // In all cases ignore times from before 2001, and skip any file where we cannot find a
                 // valid time.
-                let ts = read_timestamp_from_contents(&tc)
-                    .or_else(|| {
-                        let ts = log.timestamp?;
-                        Timestamp::from_second(ts).ok()
-                    })
-                    .or_else(|| metadata.as_ref()?.modified);
+                let ts = effective_log_timestamp(&log, &tc, metadata.as_ref().unwrap());
 
                 if !ts.is_some_and(|ts| time.contains(ts)) {
                     continue;
@@ -464,6 +522,63 @@ impl<S: BundleSource> Bundle<S> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Calls `handler` for every selected log, with metadata and a complete reader.
+    ///
+    /// Logs are processed in source order. The timestamp is resolved even when
+    /// no time bounds are set, preferring the first valid timestamp in the
+    /// inspected contents, then the filename suffix, then source modification
+    /// metadata. The reader replays the inspected prefix before the remainder,
+    /// so it yields every file byte exactly once; consumers must finish reading
+    /// or copying it before the callback returns. The reader borrows the bundle
+    /// source, so the callback must not re-enter any method on this same
+    /// `Bundle` while it is alive. A callback error stops iteration immediately
+    /// and is returned with the log path as context.
+    pub fn for_each_log<F>(
+        &self,
+        filter: LogFilter<'_>,
+        time: TimeRange,
+        mut handler: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(LogEntry, &mut dyn std::io::Read) -> anyhow::Result<()>,
+    {
+        for log in self.matching_log_files(filter) {
+            let path = &log.path;
+            let metadata = self
+                .source
+                .borrow_mut()
+                .metadata(path)
+                .with_context(|| format!("failed to read metadata for {path}"))?;
+            let mut source = self.source.borrow_mut();
+            let mut file = source
+                .open_file(path)
+                .with_context(|| format!("failed to open {path}"))?;
+            let mut inspected = Vec::with_capacity(
+                metadata.len.unwrap_or(TIME_CHECK_MAX).min(TIME_CHECK_MAX) as usize,
+            );
+            file.by_ref()
+                .take(TIME_CHECK_MAX)
+                .read_to_end(&mut inspected)
+                .with_context(|| format!("failed to read file {path}"))?;
+            let timestamp = effective_log_timestamp(&log, &inspected, &metadata);
+            if time.is_set() && !timestamp.is_some_and(|timestamp| time.contains(timestamp)) {
+                continue;
+            }
+
+            let entry = LogEntry {
+                path: log.path.clone(),
+                sled_uuid: log.sled_uuid.clone(),
+                service: log.service.clone(),
+                zone: log.zone.clone(),
+                timestamp,
+            };
+            let mut complete = io::Cursor::new(inspected).chain(file);
+            handler(entry, &mut complete)
+                .with_context(|| format!("log callback failed for {path}"))?;
+        }
         Ok(())
     }
 
@@ -621,7 +736,10 @@ impl BundleInfo {
                 .open_file(&path)
                 .with_context(|| format!("failed to open {path}"))?;
             let contents = read_file_to_string(&mut file, &path)?;
-            let (serial, is_scrimlet) = read_sled_serial(&contents)
+            let SledTxtInfo {
+                serial,
+                is_scrimlet,
+            } = parse_sled_txt(&contents)
                 .ok_or_else(|| anyhow::anyhow!("failed to parse sled serial from {path}"))?;
 
             // UNWRAP: We've confirmed above that the split length is five.
@@ -697,19 +815,6 @@ fn read_file_to_string(file: &mut dyn Read, path: &str) -> Result<String> {
     String::from_utf8(buf).with_context(|| format!("contents of {path} were not valid UTF-8"))
 }
 
-fn read_sled_serial(sled_info: &str) -> Option<(String, bool)> {
-    const SERIAL_PREFIX: &str = " serial_number: \"";
-    let serial_start = sled_info.find(SERIAL_PREFIX)? + SERIAL_PREFIX.len();
-    let serial_end = serial_start + sled_info[serial_start..].find("\"")?;
-
-    const SCRIMLET_PREFIX: &str = " is_scrimlet: ";
-    let scrimlet_start = sled_info.find(SCRIMLET_PREFIX)? + SCRIMLET_PREFIX.len();
-    let scrimlet_end = scrimlet_start + sled_info[scrimlet_start..].find(",")?;
-    let is_scrimlet = sled_info[scrimlet_start..scrimlet_end].parse().ok()?;
-
-    Some((sled_info[serial_start..serial_end].to_string(), is_scrimlet))
-}
-
 #[derive(PartialEq, Debug)]
 struct SledInfo {
     uuid: String,
@@ -747,58 +852,12 @@ impl SledInfo {
     }
 }
 
-#[derive(PartialEq, Debug)]
-struct Ereport {
-    part: String,
-    serial: String,
-    restart_id: String,
-    ena: u64,
-}
-
-impl Ereport {
-    fn from_path(path: &str) -> Option<Self> {
-        // ereports/{part-number}-{serial_number}/{restart_id}/{ENA}.json
-        if !path.starts_with("ereports") {
-            return None;
-        }
-
-        let splits: Vec<_> = path.split('/').collect();
-        if splits.len() < 4 {
-            return None;
-        }
-
-        // Part numbers contain a '-', but serials do not, at least currently.
-        // Split from the right to ensure we're finding the boundary between the two.
-        let (part, serial) = splits[1].rsplit_once('-')?;
-        let restart_id = splits[2].to_string();
-        let file_name = splits[3];
-        let ena = file_name
-            .strip_suffix(".json")
-            .and_then(|n| n.parse::<u64>().ok())?;
-
-        Some(Ereport {
-            part: part.to_string(),
-            serial: serial.to_string(),
-            restart_id,
-            ena,
-        })
-    }
-}
-
 fn matches_patterns(patterns: &[Pattern], s: &str) -> bool {
     if patterns.is_empty() {
         return true;
     }
 
     patterns.iter().any(|p| p.matches(s))
-}
-
-fn read_ereport_class(ereport_raw: &str) -> Option<&str> {
-    const CLASS_PREFIX: &str = "\"class\":\"";
-    let class_start = ereport_raw.find(CLASS_PREFIX)? + CLASS_PREFIX.len();
-    let class_end = class_start + ereport_raw[class_start..].find("\"")?;
-
-    Some(&ereport_raw[class_start..class_end])
 }
 
 /// Minimal struct to grab the timestamp from a JSON log event.
@@ -889,6 +948,16 @@ fn read_timestamp_from_contents(buf: &[u8]) -> Option<Timestamp> {
     None
 }
 
+fn effective_log_timestamp(
+    log: &LogFile,
+    inspected: &[u8],
+    metadata: &BundleFileMetadata,
+) -> Option<Timestamp> {
+    read_timestamp_from_contents(inspected)
+        .or_else(|| Timestamp::from_second(log.timestamp?).ok())
+        .or(metadata.modified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -902,6 +971,7 @@ mod tests {
     use std::io::Cursor;
     use std::rc::Rc;
     use std::str::FromStr;
+    use std::sync::OnceLock;
 
     const TEST_RACK: &str = "34261901-b550-451c-9bd0-3926bb29c40d";
     const TEST_SLED: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -1269,6 +1339,8 @@ mod tests {
         logs_after: Vec<u8>,
         ereports_list: Vec<u8>,
         ereports_show: Vec<u8>,
+        structured_ereports: Vec<EreportEntry>,
+        structured_logs: Vec<(LogEntry, Vec<u8>)>,
     }
 
     fn render_bundle(bundle: &Bundle<Box<dyn BundleSource>>) -> RenderedBundle {
@@ -1280,6 +1352,8 @@ mod tests {
             logs_after: Vec::new(),
             ereports_list: Vec::new(),
             ereports_show: Vec::new(),
+            structured_ereports: Vec::new(),
+            structured_logs: Vec::new(),
         };
 
         bundle.sleds(&mut rendered.sleds).unwrap();
@@ -1310,6 +1384,24 @@ mod tests {
         bundle
             .ereports_show(ComponentInfo::default(), false, &mut rendered.ereports_show)
             .unwrap();
+        bundle
+            .for_each_ereport(ComponentInfo::default(), |entry| {
+                rendered.structured_ereports.push(entry);
+                Ok(())
+            })
+            .unwrap();
+        bundle
+            .for_each_log(
+                LogFilter::default(),
+                TimeRange::default(),
+                |entry, reader| {
+                    let mut contents = Vec::new();
+                    reader.read_to_end(&mut contents)?;
+                    rendered.structured_logs.push((entry, contents));
+                    Ok(())
+                },
+            )
+            .unwrap();
 
         rendered
     }
@@ -1332,6 +1424,8 @@ mod tests {
 
         let zip_rendered = render_bundle(&zip_bundle);
         let directory_rendered = render_bundle(&directory_bundle);
+        assert!(!zip_rendered.structured_ereports.is_empty());
+        assert!(!zip_rendered.structured_logs.is_empty());
         assert_eq!(zip_rendered, directory_rendered);
     }
 
@@ -1692,12 +1786,169 @@ mod tests {
     }
 
     #[test]
-    fn test_read_ereport_class() {
+    fn test_parse_ereport_class_recognizes_spaced_json() {
         let ereport_str = &zip_files()[3].contents.clone().unwrap();
         assert_eq!(
-            read_ereport_class(ereport_str),
-            Some("ereport.io.pci.device")
+            parse_ereport_class(ereport_str),
+            Some("ereport.io.pci.device".to_string())
         );
+    }
+
+    fn structured_ereport_source() -> (MemorySource, Rc<RefCell<Vec<String>>>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut source = MemorySource::bundle();
+        source.events = Some(Rc::clone(&events));
+        for (path, contents) in [
+            (
+                "ereports/parta-seriala/restart-a/1.json",
+                r#"{"class":"ereport.compact","value":1}"#,
+            ),
+            (
+                "ereports/partb-serialb/restart-b/2.json",
+                "{\n  \"class\": \"ereport.spaced\",\n  \"value\": 2\n}",
+            ),
+            ("ereports/partc-serialc/restart-c/3.json", r#"{"value":3}"#),
+            ("ereports/partd-seriald/restart-d/4.json", r#"{"class":4}"#),
+            ("ereports/parte-seriale/restart-e/5.json", "not json"),
+        ] {
+            source
+                .files
+                .insert(path.to_string(), contents.as_bytes().to_vec());
+        }
+        (source, events)
+    }
+
+    #[test]
+    fn for_each_ereport_returns_owned_entries_in_source_order() {
+        let (source, _) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut entries = Vec::new();
+
+        bundle
+            .for_each_ereport(ComponentInfo::default(), |entry| {
+                entries.push(entry);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].metadata.ena, 1);
+        assert_eq!(entries[0].class.as_deref(), Some("ereport.compact"));
+        assert_eq!(entries[1].class.as_deref(), Some("ereport.spaced"));
+        assert_eq!(
+            entries[1].contents,
+            "{\n  \"class\": \"ereport.spaced\",\n  \"value\": 2\n}"
+        );
+        assert_eq!(entries[2].class, None);
+        assert_eq!(entries[3].class, None);
+        assert_eq!(entries[4].class, None);
+        assert_eq!(entries[4].path, "ereports/parte-seriale/restart-e/5.json");
+    }
+
+    #[test]
+    fn for_each_ereport_filters_paths_before_opening_and_keeps_classless_entries() {
+        let (source, events) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+        events.borrow_mut().clear();
+        let mut paths = Vec::new();
+        let parts = [
+            Pattern::from_str("parta").unwrap(),
+            Pattern::from_str("partc").unwrap(),
+            Pattern::from_str("partd").unwrap(),
+            Pattern::from_str("parte").unwrap(),
+        ];
+        let serials = [
+            Pattern::from_str("seriala").unwrap(),
+            Pattern::from_str("serialc").unwrap(),
+            Pattern::from_str("seriald").unwrap(),
+            Pattern::from_str("seriale").unwrap(),
+        ];
+        let classes = [Pattern::from_str("ereport.other").unwrap()];
+
+        bundle
+            .for_each_ereport(
+                ComponentInfo {
+                    part: &parts,
+                    serial: &serials,
+                    class: &classes,
+                },
+                |entry| {
+                    paths.push(entry.path);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            paths,
+            [
+                "ereports/partc-serialc/restart-c/3.json",
+                "ereports/partd-seriald/restart-d/4.json",
+                "ereports/parte-seriale/restart-e/5.json",
+            ]
+        );
+        assert_eq!(
+            *events.borrow(),
+            [
+                "open:ereports/parta-seriala/restart-a/1.json",
+                "open:ereports/partc-serialc/restart-c/3.json",
+                "open:ereports/partd-seriald/restart-d/4.json",
+                "open:ereports/parte-seriale/restart-e/5.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ereports_list_recognizes_spaced_class_syntax() {
+        let (source, _) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+        let classes = [Pattern::from_str("ereport.spaced").unwrap()];
+        let mut out = Vec::new();
+
+        bundle
+            .ereports_list(
+                ComponentInfo {
+                    class: &classes,
+                    ..Default::default()
+                },
+                &mut out,
+            )
+            .unwrap();
+
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("ereport.spaced"));
+        assert!(!out.contains("ereport.compact"));
+    }
+
+    #[test]
+    fn for_each_ereport_stops_and_contextualizes_handler_errors() {
+        let (source, events) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+        events.borrow_mut().clear();
+        let error = bundle
+            .for_each_ereport(ComponentInfo::default(), |_entry| {
+                anyhow::bail!("consumer stopped")
+            })
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(message.contains("consumer stopped"));
+        assert!(message.contains("ereports/parta-seriala/restart-a/1.json"));
+        assert_eq!(events.borrow().len(), 1);
+    }
+
+    #[test]
+    fn for_each_ereport_releases_source_borrow_before_callback() {
+        let (source, _) = structured_ereport_source();
+        let bundle = Bundle::from_source(source).unwrap();
+
+        bundle
+            .for_each_ereport(ComponentInfo::default(), |_entry| {
+                let mut out = Vec::new();
+                bundle.ereports_list(ComponentInfo::default(), &mut out)?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// Build a zip containing a sled with sled.txt but no logs/{zone}/{service} descendants
@@ -1753,12 +2004,18 @@ mod tests {
         const SLED_INFO: &str = r#"Sled { identity: SledIdentity { id: f1e02cab-ef5a-4405-974c-f8cf7df7d4ea, time_created: 2025-05-08T20:31:06.943606Z, time_modified: 2025-05-08T20:31:06.943606Z }, time_deleted: None, rcgen: Generation(Generation(21)), rack_id: 34261901-b550-451c-9bd0-3926bb29c40d, is_scrimlet: false, serial_number: "BRM03250001", part_number: "913-0000019", revision: SqlU32(14), usable_hardware_threads: SqlU32(128), usable_physical_ram: ByteCount(ByteCount(2186120527872)), reservoir_size: ByteCount(ByteCount(1790577737728)), ip: fd00:1122:3344:102::1, port: SqlU16(12345), last_used_address: fd00:1122:3344:102::1:3, policy: InService, state: Active, sled_agent_gen: Generation(Generation(1)), repo_depot_port: SqlU16(12348) }"#;
 
         assert_eq!(
-            read_sled_serial(SCRIMLET_INFO),
-            Some(("BRM03250000".to_string(), true))
+            parse_sled_txt(SCRIMLET_INFO),
+            Some(SledTxtInfo {
+                serial: "BRM03250000".to_string(),
+                is_scrimlet: true,
+            })
         );
         assert_eq!(
-            read_sled_serial(SLED_INFO),
-            Some(("BRM03250001".to_string(), false))
+            parse_sled_txt(SLED_INFO),
+            Some(SledTxtInfo {
+                serial: "BRM03250001".to_string(),
+                is_scrimlet: false,
+            })
         );
     }
 
@@ -1768,6 +2025,205 @@ mod tests {
         let mut out = Vec::new();
         bundle.services(&[], &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "sled-agent\n");
+    }
+
+    fn structured_log_path(file_name: &str) -> String {
+        format!("rack/{TEST_RACK}/sled/{TEST_SLED}/logs/global/test/current/{file_name}")
+    }
+
+    fn structured_log_filter() -> LogFilter<'static> {
+        static SERVICES: OnceLock<[Pattern; 1]> = OnceLock::new();
+        LogFilter {
+            service: SERVICES.get_or_init(|| [Pattern::new("test").unwrap()]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn for_each_log_uses_source_order_and_metadata_before_open_without_bounds() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        let paths = [structured_log_path("a.log"), structured_log_path("b.log")];
+        for path in &paths {
+            source.files.insert(path.clone(), path.as_bytes().to_vec());
+        }
+        source.events = Some(Rc::clone(&events));
+        let bundle = Bundle::from_source(source).unwrap();
+        events.borrow_mut().clear();
+        let mut seen = Vec::new();
+
+        bundle
+            .for_each_log(
+                structured_log_filter(),
+                TimeRange::default(),
+                |entry, reader| {
+                    let mut contents = Vec::new();
+                    reader.read_to_end(&mut contents)?;
+                    seen.push((entry, contents));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            seen.iter()
+                .map(|(entry, _)| &entry.path)
+                .collect::<Vec<_>>(),
+            [&paths[0], &paths[1]]
+        );
+        assert_eq!(seen[0].1, paths[0].as_bytes());
+        assert_eq!(seen[1].1, paths[1].as_bytes());
+        assert_eq!(
+            *events.borrow(),
+            [
+                format!("metadata:{}", paths[0]),
+                format!("open:{}", paths[0]),
+                format!("metadata:{}", paths[1]),
+                format!("open:{}", paths[1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn for_each_log_resolves_timestamps_and_filters_missing_timestamps() {
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        source.modified = Some("2025-03-01T00:00:00Z".parse().unwrap());
+        for (name, contents) in [
+            (
+                "a.log.1738368000",
+                b"{\"time\":\"2025-01-01T00:00:00Z\"}\n".as_slice(),
+            ),
+            ("b.log.1738454400", b"no content timestamp\n".as_slice()),
+            ("c.log", b"metadata fallback\n".as_slice()),
+        ] {
+            source
+                .files
+                .insert(structured_log_path(name), contents.to_vec());
+        }
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut timestamps = Vec::new();
+        bundle
+            .for_each_log(structured_log_filter(), TimeRange::default(), |entry, _| {
+                timestamps.push(entry.timestamp);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            timestamps,
+            [
+                Some("2025-01-01T00:00:00Z".parse().unwrap()),
+                Some(Timestamp::from_second(1738454400).unwrap()),
+                Some("2025-03-01T00:00:00Z".parse().unwrap()),
+            ]
+        );
+
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        source
+            .files
+            .insert(structured_log_path("missing.log"), b"none\n".to_vec());
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut unbounded = Vec::new();
+        bundle
+            .for_each_log(structured_log_filter(), TimeRange::default(), |entry, _| {
+                unbounded.push(entry.timestamp);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(unbounded, [None]);
+        let mut bounded_calls = 0;
+        bundle
+            .for_each_log(
+                structured_log_filter(),
+                TimeRange {
+                    after: Some("2024-01-01T00:00:00Z".parse().unwrap()),
+                    before: None,
+                },
+                |_, _| {
+                    bounded_calls += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(bounded_calls, 0);
+    }
+
+    #[test]
+    fn for_each_log_replays_large_prefix_and_discards_partial_reader() {
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        let first_path = structured_log_path("a.log");
+        let second_path = structured_log_path("b.log");
+        let mut first = b"{\"time\":\"2025-01-01T00:00:00Z\"}\n".to_vec();
+        first.resize(65_536, b'x');
+        first.extend_from_slice(b"distinct tail beyond inspection boundary");
+        let second = b"second complete file".to_vec();
+        source.files.insert(first_path, first.clone());
+        source.files.insert(second_path, second.clone());
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut calls = 0;
+
+        bundle
+            .for_each_log(
+                structured_log_filter(),
+                TimeRange::default(),
+                |_, reader| {
+                    calls += 1;
+                    if calls == 1 {
+                        let mut partial = [0; 7];
+                        reader.read_exact(&mut partial)?;
+                        assert_eq!(&partial, &first[..7]);
+                    } else {
+                        let mut contents = Vec::new();
+                        reader.read_to_end(&mut contents)?;
+                        assert_eq!(contents, second);
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, 2);
+
+        let mut complete = Vec::new();
+        bundle
+            .for_each_log(
+                LogFilter {
+                    service: &[Pattern::new("test").unwrap()],
+                    path: &[Pattern::new("*a.log").unwrap()],
+                    ..Default::default()
+                },
+                TimeRange::default(),
+                |_, reader| {
+                    reader.read_to_end(&mut complete)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(complete, first);
+    }
+
+    #[test]
+    fn for_each_log_stops_and_contextualizes_callback_errors() {
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        let first = structured_log_path("a.log");
+        source.files.insert(first.clone(), Vec::new());
+        source
+            .files
+            .insert(structured_log_path("b.log"), Vec::new());
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut calls = 0;
+        let error = bundle
+            .for_each_log(structured_log_filter(), TimeRange::default(), |_, _| {
+                calls += 1;
+                anyhow::bail!("handler failed")
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains(&first));
+        assert!(format!("{error:#}").contains("handler failed"));
     }
 
     #[test]

@@ -59,6 +59,12 @@ fn list_sleds(source: Box<dyn BundleSource>) -> Result<()> {
 The CLI remains ZIP-only; directory and custom sources are library APIs. ZIP
 lookup is name-based, so duplicate ZIP entry names are unsupported.
 
+Structured consumers can use `parse_sled_txt` and `parse_ereport_path`, or
+stream matching files with `Bundle::for_each_ereport` and
+`Bundle::for_each_log`. Ereport callbacks receive owned metadata and raw
+contents. Log callbacks receive a complete reader that must be consumed before
+the callback returns and must not re-enter the same `Bundle`.
+
 == Usage
 
 List sleds in the bundle:
