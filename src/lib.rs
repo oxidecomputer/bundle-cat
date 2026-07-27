@@ -11,15 +11,19 @@ use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 use zip::ZipArchive;
-use zip::read::ZipFile;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Seek, Write};
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::str;
 use std::thread;
+
+mod source;
+
+pub use source::{BundleFileMetadata, BundleSource, DirectoryBundleSource, ZipBundleSource};
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
@@ -94,7 +98,7 @@ pub struct LogOutput<'a> {
     pub no_header: bool,
 
     /// Pipe the contents of each selected file to the standard input of this command.
-    /// The command will be executed as '$SHELL -c <EXEC>'.
+    /// The command will be executed as `$SHELL -c <EXEC>`.
     pub exec: Option<&'a str>,
 }
 
@@ -180,33 +184,49 @@ impl LogFile {
 }
 
 /// An Oxide support bundle.
-pub struct Bundle<R> {
+pub struct Bundle<S> {
     info: BundleInfo,
-    archive: RefCell<ZipArchive<R>>,
+    source: RefCell<S>,
 }
 
-impl<R: Read + Seek> Bundle<R> {
+impl<R: Read + Seek> Bundle<ZipBundleSource<R>> {
     /// Construct a `Bundle` from a `ZipArchive`.
     pub fn from_archive(archive: ZipArchive<R>) -> Result<Self> {
-        let archive = RefCell::new(archive);
-        let info = BundleInfo::from_archive(&mut archive.borrow_mut())?;
-        Ok(Self { info, archive })
+        Self::from_source(ZipBundleSource::from_archive(archive)?)
+    }
+}
+
+impl Bundle<DirectoryBundleSource> {
+    /// Construct a `Bundle` from an unpacked directory tree.
+    pub fn open_dir(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_source(DirectoryBundleSource::open(path)?)
+    }
+}
+
+impl<S: BundleSource> Bundle<S> {
+    /// Construct a `Bundle` from a bundle source.
+    pub fn from_source(mut source: S) -> Result<Self> {
+        let info = BundleInfo::from_source(&mut source)?;
+        Ok(Self {
+            info,
+            source: RefCell::new(source),
+        })
     }
 
     /// List all ereports in the archive.
     pub fn ereports_list<W: Write>(&self, components: ComponentInfo<'_>, mut out: W) -> Result<()> {
-        let archive = &mut self.archive.borrow_mut();
+        let source = &mut self.source.borrow_mut();
 
-        let ereports: Vec<_> = archive
+        let ereports: Vec<_> = source
             .file_names()
-            .enumerate()
-            .filter_map(|(i, path)| {
-                let ereport = Ereport::from_path(path)?;
+            .into_iter()
+            .filter_map(|path| {
+                let ereport = Ereport::from_path(&path)?;
 
                 if matches_patterns(components.part, &ereport.part)
                     && matches_patterns(components.serial, &ereport.serial)
                 {
-                    Some((i, ereport))
+                    Some((path, ereport))
                 } else {
                     None
                 }
@@ -225,11 +245,11 @@ impl<R: Read + Seek> Bundle<R> {
             "{:<11}\t{:<11}\t{:<36}\t{:<max_ena_len$}\tCLASS",
             "PART", "SERIAL", "RESTART_ID", "ENA",
         )?;
-        for (i, ereport) in ereports {
-            let mut file = archive
-                .by_index(i)
-                .with_context(|| format!("failed to access file index {i}"))?;
-            let contents = read_file_to_string(&mut file)?;
+        for (path, ereport) in ereports {
+            let mut file = source
+                .open_file(&path)
+                .with_context(|| format!("failed to open {path}"))?;
+            let contents = read_file_to_string(&mut file, &path)?;
             let ereport_class = read_ereport_class(&contents);
 
             if let Some(ereport_class) = ereport_class
@@ -258,29 +278,29 @@ impl<R: Read + Seek> Bundle<R> {
         no_header: bool,
         mut out: W,
     ) -> Result<()> {
-        let archive = &mut self.archive.borrow_mut();
-        let matching_reports: Vec<_> = archive
+        let source = &mut self.source.borrow_mut();
+        let matching_reports: Vec<_> = source
             .file_names()
-            .enumerate()
-            .filter_map(|(i, path)| {
-                let ereport = Ereport::from_path(path)?;
+            .into_iter()
+            .filter_map(|path| {
+                let ereport = Ereport::from_path(&path)?;
 
                 if matches_patterns(components.part, &ereport.part)
                     && matches_patterns(components.serial, &ereport.serial)
                 {
-                    Some(i)
+                    Some((path, ereport))
                 } else {
                     None
                 }
             })
             .collect();
 
-        for i in matching_reports {
-            let mut file = archive
-                .by_index(i)
-                .with_context(|| format!("failed to access file index {i}"))?;
+        for (path, _ereport) in matching_reports {
+            let mut file = source
+                .open_file(&path)
+                .with_context(|| format!("failed to open {path}"))?;
 
-            let contents = read_file_to_string(&mut file)?;
+            let contents = read_file_to_string(&mut file, &path)?;
 
             if let Some(ereport_class) = read_ereport_class(&contents)
                 && !matches_patterns(components.class, ereport_class)
@@ -289,7 +309,7 @@ impl<R: Read + Seek> Bundle<R> {
             }
 
             if !no_header {
-                writeln!(out, "==> {} <==", file.name())?;
+                writeln!(out, "==> {path} <==")?;
             }
 
             if let Ok(json) = serde_json::from_str::<Value>(&contents)
@@ -316,12 +336,12 @@ impl<R: Read + Seek> Bundle<R> {
         output: LogOutput<'_>,
         mut out: W,
     ) -> Result<()> {
-        let archive = &mut self.archive.borrow_mut();
-        let matching_files: Vec<_> = archive
+        let source = &mut self.source.borrow_mut();
+        let matching_files: Vec<_> = source
             .file_names()
-            .enumerate()
-            .filter_map(|(i, name)| {
-                let log_file = LogFile::from_path(name)?;
+            .into_iter()
+            .filter_map(|path| {
+                let log_file = LogFile::from_path(&path)?;
 
                 let sled_info = self
                     .info
@@ -334,23 +354,36 @@ impl<R: Read + Seek> Bundle<R> {
                     && log_file.matches_zones(filter.zone)
                     && log_file.matches_paths(filter.path)
                 {
-                    Some((i, log_file))
+                    Some((path, log_file))
                 } else {
                     None
                 }
             })
             .collect();
 
-        for (i, log) in matching_files {
-            let mut file = archive.by_index(i)?;
+        for (path, log) in matching_files {
+            let metadata = time
+                .is_set()
+                .then(|| source.metadata(&path))
+                .transpose()
+                .with_context(|| format!("failed to read metadata for {path}"))?;
+            let mut file = source
+                .open_file(&path)
+                .with_context(|| format!("failed to open {path}"))?;
 
             let time_check_buf = if time.is_set() {
                 const TIME_CHECK_MAX: u64 = 1 << 16;
-                let buf_size = file.size().min(TIME_CHECK_MAX) as usize;
-                let mut tc = vec![0u8; buf_size];
-
-                file.read_exact(&mut tc)
-                    .with_context(|| format!("failed to read file {}", file.name()))?;
+                let mut tc = Vec::with_capacity(
+                    metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.len)
+                        .unwrap_or(TIME_CHECK_MAX)
+                        .min(TIME_CHECK_MAX) as usize,
+                );
+                file.by_ref()
+                    .take(TIME_CHECK_MAX)
+                    .read_to_end(&mut tc)
+                    .with_context(|| format!("failed to read file {path}"))?;
 
                 // Try several methods of finding the log's timeframe, in order of decreasing accuracy:
                 // 1. Try to find a valid timestamp from the first 64k of the file.
@@ -364,11 +397,7 @@ impl<R: Read + Seek> Bundle<R> {
                         let ts = log.timestamp?;
                         Timestamp::from_second(ts).ok()
                     })
-                    .or_else(|| {
-                        let zip_time = file.last_modified()?;
-                        let civil = jiff::civil::DateTime::try_from(zip_time).ok()?;
-                        civil.in_tz("UTC").ok().map(|t| t.timestamp())
-                    });
+                    .or_else(|| metadata.as_ref()?.modified);
 
                 if !ts.is_some_and(|ts| time.contains(ts)) {
                     continue;
@@ -381,12 +410,12 @@ impl<R: Read + Seek> Bundle<R> {
             };
 
             if output.list {
-                writeln!(out, "{}", file.name())?;
+                writeln!(out, "{path}")?;
                 continue;
             }
 
             if !output.no_header {
-                writeln!(out, "==> {} <==", file.name())?;
+                writeln!(out, "==> {path} <==")?;
             }
 
             if let Some(exec) = output.exec {
@@ -542,72 +571,61 @@ struct BundleInfo {
 }
 
 impl BundleInfo {
-    pub fn from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Self> {
-        let mut sled_txt_indices = Vec::with_capacity(32);
+    fn from_source<S: BundleSource>(source: &mut S) -> Result<Self> {
+        let mut sled_txt_paths = Vec::with_capacity(32);
 
         let mut sleds = BTreeMap::new();
-        let mut sled_services = BTreeMap::new();
-        let mut sled_zones = BTreeMap::new();
+        let mut sled_services: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut sled_zones: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-        let mut splits = Vec::with_capacity(10);
-        for (i, name) in archive.file_names().enumerate() {
-            splits.clear();
-
+        let names = source.file_names();
+        for name in &names {
             // rack/{rack_uuid}/sled/{sled_uuid}/logs/{zone}/{service}/...
-            splits.extend(name.split('/'));
+            let splits: Vec<_> = name.split('/').collect();
+            let is_log_file = !name.ends_with('/')
+                && splits.first() == Some(&"rack")
+                && splits.get(2) == Some(&"sled")
+                && splits.get(4) == Some(&"logs");
 
-            // The zone directory itself will have a length of 7, but we want zone directories that have at least one child.
-            // Empty directories may exist for zones that don't actually exist on the sled, e.g., `oxz_switch`.
-            if name.starts_with("rack") && splits.len() == 8 {
-                let sled_uuid = splits[3];
-                let zone = splits[5];
-
-                let sled_entry = sled_zones.entry(sled_uuid).or_insert_with(BTreeSet::new);
-                sled_entry.insert(zone);
+            // Infer inventory only from descendants. Directory sources do not list
+            // directories, and empty ZIP directories must not count.
+            if is_log_file
+                && let (Some(sled_uuid), Some(zone), Some(service), Some(descendant)) =
+                    (splits.get(3), splits.get(5), splits.get(6), splits.get(7))
+                && !sled_uuid.is_empty()
+                && !zone.is_empty()
+                && !service.is_empty()
+                && !descendant.is_empty()
+            {
+                sled_zones
+                    .entry((*sled_uuid).to_string())
+                    .or_default()
+                    .insert((*zone).to_string());
+                sled_services
+                    .entry((*sled_uuid).to_string())
+                    .or_default()
+                    .insert((*service).to_string());
             }
 
-            if name.starts_with("rack") && splits.len() == 9 {
-                let sled_uuid = splits[3];
-                let service = splits[6];
-
-                let sled_entry = sled_services.entry(sled_uuid).or_insert_with(BTreeSet::new);
-                sled_entry.insert(service);
-            }
-
-            if name.starts_with("rack") && name.ends_with("sled.txt") && splits.len() == 5 {
-                sled_txt_indices.push(i);
+            if splits.first() == Some(&"rack")
+                && splits.get(2) == Some(&"sled")
+                && splits.get(4) == Some(&"sled.txt")
+                && splits.len() == 5
+            {
+                sled_txt_paths.push(name.clone());
             }
         }
 
-        let mut sled_services: BTreeMap<_, BTreeSet<_>> = sled_services
-            .into_iter()
-            .map(|(sled, services)| {
-                (
-                    sled.to_string(),
-                    services.into_iter().map(|s| s.to_string()).collect(),
-                )
-            })
-            .collect();
-        let mut sled_zones: BTreeMap<_, BTreeSet<_>> = sled_zones
-            .into_iter()
-            .map(|(sled, zones)| {
-                (
-                    sled.to_string(),
-                    zones.into_iter().map(|s| s.to_string()).collect(),
-                )
-            })
-            .collect();
-
-        for i in sled_txt_indices {
-            let mut file = archive.by_index(i)?;
-
-            let contents = read_file_to_string(&mut file)?;
-            let (serial, is_scrimlet) = read_sled_serial(&contents).ok_or_else(|| {
-                anyhow::anyhow!("failed to parse sled serial from {}", file.name())
-            })?;
+        for path in sled_txt_paths {
+            let mut file = source
+                .open_file(&path)
+                .with_context(|| format!("failed to open {path}"))?;
+            let contents = read_file_to_string(&mut file, &path)?;
+            let (serial, is_scrimlet) = read_sled_serial(&contents)
+                .ok_or_else(|| anyhow::anyhow!("failed to parse sled serial from {path}"))?;
 
             // UNWRAP: We've confirmed above that the split length is five.
-            let uuid = file.name().split('/').nth(3).unwrap().to_string();
+            let uuid = path.split('/').nth(3).unwrap().to_string();
 
             let services = sled_services
                 .remove(&uuid)
@@ -633,14 +651,21 @@ impl BundleInfo {
         }
 
         let mut unhealthy_sleds = BTreeMap::new();
-        if let Ok(mut sled_info) = archive.by_name("sled_info.json") {
+        if names.iter().any(|name| name == "sled_info.json") {
+            let mut sled_info = source
+                .open_file("sled_info.json")
+                .context("failed to open sled_info.json")?;
             #[derive(Deserialize, Debug)]
             struct SledId {
                 cubby: Option<u16>,
                 uuid: Option<String>,
             }
 
-            match serde_json::from_reader::<_, BTreeMap<String, SledId>>(&mut sled_info) {
+            let mut contents = Vec::new();
+            sled_info
+                .read_to_end(&mut contents)
+                .context("failed to read sled_info.json")?;
+            match serde_json::from_slice::<BTreeMap<String, SledId>>(&contents) {
                 Ok(cubby_info) => {
                     for (serial, id) in cubby_info.into_iter() {
                         if let Some(uuid) = id.uuid {
@@ -665,12 +690,11 @@ impl BundleInfo {
     }
 }
 
-fn read_file_to_string<R: Read>(file: &mut ZipFile<R>) -> Result<String> {
-    let mut buf = Vec::with_capacity(file.size() as usize);
+fn read_file_to_string(file: &mut dyn Read, path: &str) -> Result<String> {
+    let mut buf = Vec::new();
     file.read_to_end(&mut buf)
-        .with_context(|| format!("failed to read contents of {}", file.name()))?;
-    String::from_utf8(buf)
-        .with_context(|| format!("contents of {} were not valid UTF-8", file.name()))
+        .with_context(|| format!("failed to read contents of {path}"))?;
+    String::from_utf8(buf).with_context(|| format!("contents of {path} were not valid UTF-8"))
 }
 
 fn read_sled_serial(sled_info: &str) -> Option<(String, bool)> {
@@ -874,8 +898,71 @@ mod tests {
     use zip::write::{SimpleFileOptions, ZipWriter};
     use zip::{CompressionMethod, DateTime};
 
+    use std::fs::{self, FileTimes};
     use std::io::Cursor;
+    use std::rc::Rc;
     use std::str::FromStr;
+
+    const TEST_RACK: &str = "34261901-b550-451c-9bd0-3926bb29c40d";
+    const TEST_SLED: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    #[derive(Default)]
+    struct MemorySource {
+        files: BTreeMap<String, Vec<u8>>,
+        events: Option<Rc<RefCell<Vec<String>>>>,
+        modified: Option<Timestamp>,
+    }
+
+    impl MemorySource {
+        fn bundle() -> Self {
+            let sled_path = format!("rack/{TEST_RACK}/sled/{TEST_SLED}/sled.txt");
+            let log_path = format!(
+                "rack/{TEST_RACK}/sled/{TEST_SLED}/logs/global/sled-agent/current/oxide-sled-agent:default.log"
+            );
+            let sled =
+                r#"Sled { is_scrimlet: false, serial_number: "BRM99990001", ignored: true }"#
+                    .to_string();
+            Self {
+                files: BTreeMap::from([
+                    (sled_path, sled.into_bytes()),
+                    (
+                        log_path,
+                        b"{\"time\":\"2025-09-24T06:30:00Z\",\"msg\":\"complete\"}\nsecond line\n"
+                            .to_vec(),
+                    ),
+                ]),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl BundleSource for MemorySource {
+        fn file_names(&self) -> Vec<String> {
+            self.files.keys().cloned().collect()
+        }
+
+        fn open_file<'a>(&'a mut self, path: &str) -> Result<Box<dyn Read + 'a>> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push(format!("open:{path}"));
+            }
+            let contents = self
+                .files
+                .get(path)
+                .with_context(|| format!("missing test file {path}"))?
+                .clone();
+            Ok(Box::new(Cursor::new(contents)))
+        }
+
+        fn metadata(&mut self, path: &str) -> Result<BundleFileMetadata> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push(format!("metadata:{path}"));
+            }
+            Ok(BundleFileMetadata {
+                len: self.files.get(path).map(|contents| contents.len() as u64),
+                modified: self.modified,
+            })
+        }
+    }
 
     #[derive(Default)]
     struct ZipFile {
@@ -1149,6 +1236,103 @@ mod tests {
         }
 
         zip.finish_into_readable().unwrap()
+    }
+
+    fn build_directory(root: &Path) {
+        for file in zip_files() {
+            let path = root.join(file.name);
+            if let Some(contents) = file.contents {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, [contents.as_bytes(), b"\n"].concat()).unwrap();
+
+                let civil =
+                    jiff::civil::DateTime::try_from(file.mtime.unwrap_or_default()).unwrap();
+                let timestamp = civil.to_zoned(jiff::tz::TimeZone::UTC).unwrap().timestamp();
+                fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(FileTimes::new().set_modified(timestamp.into()))
+                    .unwrap();
+            } else {
+                fs::create_dir_all(path).unwrap();
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct RenderedBundle {
+        sleds: Vec<u8>,
+        services: Vec<u8>,
+        zones: Vec<u8>,
+        logs: Vec<u8>,
+        logs_after: Vec<u8>,
+        ereports_list: Vec<u8>,
+        ereports_show: Vec<u8>,
+    }
+
+    fn render_bundle(bundle: &Bundle<Box<dyn BundleSource>>) -> RenderedBundle {
+        let mut rendered = RenderedBundle {
+            sleds: Vec::new(),
+            services: Vec::new(),
+            zones: Vec::new(),
+            logs: Vec::new(),
+            logs_after: Vec::new(),
+            ereports_list: Vec::new(),
+            ereports_show: Vec::new(),
+        };
+
+        bundle.sleds(&mut rendered.sleds).unwrap();
+        bundle.services(&[], &mut rendered.services).unwrap();
+        bundle.zones(&[], &mut rendered.zones).unwrap();
+        bundle
+            .logs(
+                LogFilter::default(),
+                TimeRange::default(),
+                LogOutput::default(),
+                &mut rendered.logs,
+            )
+            .unwrap();
+        bundle
+            .logs(
+                LogFilter::default(),
+                TimeRange {
+                    after: Some("2025-09-24T06:00:00Z".parse().unwrap()),
+                    ..Default::default()
+                },
+                LogOutput::default(),
+                &mut rendered.logs_after,
+            )
+            .unwrap();
+        bundle
+            .ereports_list(ComponentInfo::default(), &mut rendered.ereports_list)
+            .unwrap();
+        bundle
+            .ereports_show(ComponentInfo::default(), false, &mut rendered.ereports_show)
+            .unwrap();
+
+        rendered
+    }
+
+    #[test]
+    fn zip_and_directory_sources_have_matching_text_output() {
+        let mut buf = Vec::new();
+        drop(build_zip(&mut buf));
+        let zip_source: Box<dyn BundleSource> = Box::new(
+            ZipBundleSource::from_archive(ZipArchive::new(Cursor::new(buf)).unwrap()).unwrap(),
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        build_directory(temp.path());
+        let directory_source: Box<dyn BundleSource> =
+            Box::new(DirectoryBundleSource::open(temp.path()).unwrap());
+
+        let zip_bundle = Bundle::from_source(zip_source).unwrap();
+        let directory_bundle = Bundle::from_source(directory_source).unwrap();
+
+        let zip_rendered = render_bundle(&zip_bundle);
+        let directory_rendered = render_bundle(&directory_bundle);
+        assert_eq!(zip_rendered, directory_rendered);
     }
 
     #[test]
@@ -1576,5 +1760,179 @@ mod tests {
             read_sled_serial(SLED_INFO),
             Some(("BRM03250001".to_string(), false))
         );
+    }
+
+    #[test]
+    fn bundle_from_source_reads_inventory() {
+        let bundle = Bundle::from_source(MemorySource::bundle()).unwrap();
+        let mut out = Vec::new();
+        bundle.services(&[], &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "sled-agent\n");
+    }
+
+    #[test]
+    fn shallow_regular_log_path_does_not_infer_zone_or_service() {
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        source.files.insert(
+            format!("rack/{TEST_RACK}/sled/{TEST_SLED}/logs/global/sled-agent"),
+            Vec::new(),
+        );
+
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut zones = Vec::new();
+        let mut services = Vec::new();
+        bundle.zones(&[], &mut zones).unwrap();
+        bundle.services(&[], &mut services).unwrap();
+
+        assert!(zones.is_empty());
+        assert!(services.is_empty());
+    }
+
+    #[test]
+    fn empty_inventory_path_components_do_not_infer_zone_or_service() {
+        let mut source = MemorySource::bundle();
+        source.files.retain(|path, _| path.ends_with("sled.txt"));
+        for path in ["logs//service/file", "logs/zone//file"] {
+            source.files.insert(
+                format!("rack/{TEST_RACK}/sled/{TEST_SLED}/{path}"),
+                Vec::new(),
+            );
+        }
+
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut zones = Vec::new();
+        let mut services = Vec::new();
+        bundle.zones(&[], &mut zones).unwrap();
+        bundle.services(&[], &mut services).unwrap();
+
+        assert!(zones.is_empty());
+        assert!(services.is_empty());
+    }
+
+    #[test]
+    fn bundle_open_dir_reads_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = MemorySource::bundle();
+        for (name, contents) in source.files {
+            let path = temp.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        let bundle = Bundle::open_dir(temp.path()).unwrap();
+        let mut out = Vec::new();
+        bundle.zones(&[], &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "global\n");
+    }
+
+    #[test]
+    fn time_filtered_logs_fetch_metadata_before_open_and_write_complete_file_once() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut source = MemorySource::bundle();
+        source.events = Some(Rc::clone(&events));
+        let bundle = Bundle::from_source(source).unwrap();
+        events.borrow_mut().clear();
+
+        let mut out = Vec::new();
+        bundle
+            .logs(
+                LogFilter {
+                    service: &[Pattern::new("sled-agent").unwrap()],
+                    ..Default::default()
+                },
+                TimeRange {
+                    after: Some("2025-09-01T00:00:00Z".parse().unwrap()),
+                    before: Some("2025-10-01T00:00:00Z".parse().unwrap()),
+                },
+                LogOutput {
+                    no_header: true,
+                    ..Default::default()
+                },
+                &mut out,
+            )
+            .unwrap();
+
+        let log_path = format!(
+            "rack/{TEST_RACK}/sled/{TEST_SLED}/logs/global/sled-agent/current/oxide-sled-agent:default.log"
+        );
+        assert_eq!(
+            *events.borrow(),
+            [format!("metadata:{log_path}"), format!("open:{log_path}")]
+        );
+        assert_eq!(
+            out,
+            b"{\"time\":\"2025-09-24T06:30:00Z\",\"msg\":\"complete\"}\nsecond line\n"
+        );
+    }
+
+    #[test]
+    fn log_timestamp_fallbacks_follow_content_filename_metadata_precedence() {
+        let cases = [
+            (
+                "content timestamp",
+                "test.log.1749945600",
+                b"{\"time\":\"2024-06-15T00:00:00Z\"}\n".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                "filename timestamp",
+                "test.log.1718409600",
+                b"no timestamp\n".as_slice(),
+                b"".as_slice(),
+            ),
+            (
+                "metadata timestamp",
+                "test.log",
+                b"selected exactly once\n".as_slice(),
+                b"selected exactly once\n".as_slice(),
+            ),
+        ];
+
+        for (label, file_name, contents, expected) in cases {
+            let sled_path = format!("rack/{TEST_RACK}/sled/{TEST_SLED}/sled.txt");
+            let log_path = format!("rack/{TEST_RACK}/sled/{TEST_SLED}/logs/zone/test/{file_name}");
+            let source = MemorySource {
+                files: BTreeMap::from([
+                    (
+                        sled_path,
+                        br#"Sled { is_scrimlet: false, serial_number: "BRM99990001" }"#.to_vec(),
+                    ),
+                    (log_path, contents.to_vec()),
+                ]),
+                modified: Some("2025-06-15T00:00:00Z".parse().unwrap()),
+                ..Default::default()
+            };
+            let bundle = Bundle::from_source(source).unwrap();
+            let mut out = Vec::new();
+
+            bundle
+                .logs(
+                    LogFilter {
+                        service: &[Pattern::new("test").unwrap()],
+                        ..Default::default()
+                    },
+                    TimeRange {
+                        after: Some("2025-01-01T00:00:00Z".parse().unwrap()),
+                        before: Some("2026-01-01T00:00:00Z".parse().unwrap()),
+                    },
+                    LogOutput {
+                        no_header: true,
+                        ..Default::default()
+                    },
+                    &mut out,
+                )
+                .unwrap();
+
+            assert_eq!(out, expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn boxed_bundle_source_executes_existing_operation() {
+        let source: Box<dyn BundleSource> = Box::new(MemorySource::bundle());
+        let bundle = Bundle::from_source(source).unwrap();
+        let mut out = Vec::new();
+        bundle.services(&[], &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "sled-agent\n");
     }
 }
