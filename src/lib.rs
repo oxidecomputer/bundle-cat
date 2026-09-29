@@ -1223,11 +1223,21 @@ mod tests {
     fn build_zip(buf: &mut Vec<u8>) -> ZipArchive<Cursor<&[u8]>> {
         let mut zip = ZipWriter::new(Cursor::new(&mut *buf));
 
+        // Alternate between stored and deflated files, as found in real bundles, so that each kind
+        // of file is read through both paths.
+        let mut deflate = false;
         for file in zip_files() {
             let options = SimpleFileOptions::default()
                 .compression_method(CompressionMethod::Stored)
                 .last_modified_time(file.mtime.unwrap_or_default());
             if let Some(contents) = file.contents {
+                let options = if deflate {
+                    options.compression_method(CompressionMethod::Deflated)
+                } else {
+                    options
+                };
+                deflate = !deflate;
+
                 zip.start_file(file.name, options).unwrap();
                 zip.write_all(contents.as_bytes()).unwrap();
                 zip.write_all(b"\n").unwrap();
