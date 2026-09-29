@@ -24,6 +24,9 @@ use std::thread;
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
 
+/// How much of a log file to search for a timestamp.
+const TIME_CHECK_MAX: u64 = 1 << 16;
+
 /// Glob-pattern filters selecting ereports by hardware component.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct ComponentInfo<'a> {
@@ -341,53 +344,27 @@ impl<R: Read + Seek> Bundle<R> {
             })
             .collect();
 
-        for (i, log) in matching_files {
-            let mut file = archive.by_index(i)?;
+        let in_range = if time.is_set() {
+            Some(check_times(archive, &matching_files, time)?)
+        } else {
+            None
+        };
 
-            let time_check_buf = if time.is_set() {
-                const TIME_CHECK_MAX: u64 = 1 << 16;
-                let buf_size = file.size().min(TIME_CHECK_MAX) as usize;
-                let mut tc = vec![0u8; buf_size];
-
-                file.read_exact(&mut tc)
-                    .with_context(|| format!("failed to read file {}", file.name()))?;
-
-                // Try several methods of finding the log's timeframe, in order of decreasing accuracy:
-                // 1. Try to find a valid timestamp from the first 64k of the file.
-                // 2. Check for a the timestamp appended to the file name, only available for archived
-                //    logs.
-                // 3. Check the file's mtime in the zip, which will be available with R17.
-                // In all cases ignore times from before 2001, and skip any file where we cannot find a
-                // valid time.
-                let ts = read_timestamp_from_contents(&tc)
-                    .or_else(|| {
-                        let ts = log.timestamp?;
-                        Timestamp::from_second(ts).ok()
-                    })
-                    .or_else(|| {
-                        let zip_time = file.last_modified()?;
-                        let civil = jiff::civil::DateTime::try_from(zip_time).ok()?;
-                        civil.in_tz("UTC").ok().map(|t| t.timestamp())
-                    });
-
-                if !ts.is_some_and(|ts| time.contains(ts)) {
-                    continue;
-                }
-
-                // Only retain buffer if we'll need it for output
-                (!output.list).then_some(tc)
-            } else {
-                None
-            };
+        for (n, (i, log)) in matching_files.iter().enumerate() {
+            if in_range.as_ref().is_some_and(|in_range| !in_range[n]) {
+                continue;
+            }
 
             if output.list {
-                writeln!(out, "{}", file.name())?;
+                writeln!(out, "{}", log.path)?;
                 continue;
             }
 
             if !output.no_header {
-                writeln!(out, "==> {} <==", file.name())?;
+                writeln!(out, "==> {} <==", log.path)?;
             }
+
+            let mut file = archive.by_index(*i)?;
 
             if let Some(exec) = output.exec {
                 let shell = std::env::var("SHELL").unwrap_or("/bin/sh".to_string());
@@ -405,7 +382,6 @@ impl<R: Read + Seek> Bundle<R> {
                     let out_writer = s.spawn(|| io::copy(&mut child_out, &mut out));
 
                     let in_result = write_file_content(
-                        &time_check_buf,
                         &mut file,
                         &mut child_in,
                         output.line_ct.map(|l| l.get()),
@@ -422,12 +398,7 @@ impl<R: Read + Seek> Bundle<R> {
                     anyhow::bail!("command '{exec}' exited with {status}");
                 }
             } else {
-                write_file_content(
-                    &time_check_buf,
-                    &mut file,
-                    &mut out,
-                    output.line_ct.map(|l| l.get()),
-                )?;
+                write_file_content(&mut file, &mut out, output.line_ct.map(|l| l.get()))?;
             }
 
             if !output.no_header {
@@ -673,6 +644,50 @@ fn read_file_to_string<R: Read>(file: &mut ZipFile<R>) -> Result<String> {
         .with_context(|| format!("contents of {} were not valid UTF-8", file.name()))
 }
 
+/// Determine which of `logs` fall within `time`.
+fn check_times<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    logs: &[(usize, LogFile)],
+    time: TimeRange,
+) -> Result<Vec<bool>> {
+    let mut buf = Vec::with_capacity(TIME_CHECK_MAX as usize);
+    logs.iter()
+        .map(|(i, log)| {
+            let mut file = archive.by_index(*i)?;
+            let ts = log_timestamp(&mut file, log, &mut buf)?;
+            Ok(ts.is_some_and(|ts| time.contains(ts)))
+        })
+        .collect()
+}
+
+/// Find the log's timeframe, using `buf` to hold the start of the file.
+fn log_timestamp<R: Read>(
+    file: &mut ZipFile<R>,
+    log: &LogFile,
+    buf: &mut Vec<u8>,
+) -> Result<Option<Timestamp>> {
+    buf.clear();
+    file.by_ref()
+        .take(TIME_CHECK_MAX)
+        .read_to_end(buf)
+        .with_context(|| format!("failed to read file {}", log.path))?;
+
+    // Try several methods of finding the log's timeframe, in order of decreasing accuracy:
+    // 1. Try to find a valid timestamp from the first 64k of the file.
+    // 2. Check for a the timestamp appended to the file name, only available for archived
+    //    logs.
+    // 3. Check the file's mtime in the zip, which will be available with R17.
+    // In all cases ignore times from before 2001, and skip any file where we cannot find a
+    // valid time.
+    Ok(read_timestamp_from_contents(buf)
+        .or_else(|| Timestamp::from_second(log.timestamp?).ok())
+        .or_else(|| {
+            let zip_time = file.last_modified()?;
+            let civil = jiff::civil::DateTime::try_from(zip_time).ok()?;
+            civil.in_tz("UTC").ok().map(|t| t.timestamp())
+        }))
+}
+
 fn read_sled_serial(sled_info: &str) -> Option<(String, bool)> {
     const SERIAL_PREFIX: &str = " serial_number: \"";
     let serial_start = sled_info.find(SERIAL_PREFIX)? + SERIAL_PREFIX.len();
@@ -784,40 +799,14 @@ struct LogTimestamp {
 }
 
 fn write_file_content<R: Read, W: Write>(
-    time_check_buf: &Option<Vec<u8>>,
     file: &mut R,
     out: &mut W,
     line_ct: Option<usize>,
 ) -> io::Result<()> {
-    if let Some(line_ct) = line_ct {
-        let (cached_lines, ending_offset) = time_check_buf
-            .as_ref()
-            .map(|tc| {
-                let mut cached = 0;
-                let mut end = 0;
-                for i in tc.find_iter(b"\n").take(line_ct) {
-                    cached += 1;
-                    end = i;
-                }
-                (cached, end)
-            })
-            .unwrap_or((0, 0));
-
-        match time_check_buf {
-            Some(tc) if cached_lines == line_ct => out.write_all(&tc[..=ending_offset])?,
-            Some(tc) => {
-                out.write_all(tc)?;
-                write_n_lines(file, out, line_ct - cached_lines)?;
-            }
-            None => write_n_lines(file, out, line_ct)?,
-        }
-    } else {
-        if let Some(tc) = time_check_buf {
-            out.write_all(tc)?;
-        }
-        io::copy(file, out)?;
+    match line_ct {
+        Some(line_ct) => write_n_lines(file, out, line_ct),
+        None => io::copy(file, out).map(|_| ()),
     }
-    Ok(())
 }
 
 fn write_n_lines<R: Read, W: Write>(
