@@ -20,6 +20,9 @@ use std::process;
 
 use bundle_cat::{Bundle, ComponentInfo, LogFilter, LogOutput, TimeRange};
 
+/// Upper bound on the number of threads used to search logs for timestamps.
+const MAX_THREADS: NonZeroUsize = NonZeroUsize::new(6).unwrap();
+
 #[derive(Parser, Debug)]
 #[command(about = "Filter and extract logs from support bundles")]
 struct Cli {
@@ -191,8 +194,13 @@ fn run() -> Result<()> {
     let archive = ZipArchive::from_file(file, &mut buf).context("failed to read zip archive")?;
     drop(buf);
 
-    let bundle =
-        Bundle::from_archive(archive).context("failed to parse sled information from bundle")?;
+    // Searching logs for timestamps stops scaling well past six threads.
+    let threads = std::thread::available_parallelism()
+        .unwrap_or(NonZeroUsize::MIN)
+        .min(MAX_THREADS);
+    let bundle = Bundle::from_archive(archive)
+        .context("failed to parse sled information from bundle")?
+        .with_threads(threads);
 
     match &args.command {
         Commands::Ereports(EreportCmds::List(l)) => bundle.ereports_list(

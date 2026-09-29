@@ -21,6 +21,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::num::NonZeroUsize;
 use std::process::{Command, Stdio};
 use std::str;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 /// Ignore lines with timestamps from the previous millenium.
@@ -215,13 +216,24 @@ struct LogEntry {
 pub struct Bundle<R> {
     info: BundleInfo,
     archive: ZipArchive<R>,
+    threads: NonZeroUsize,
 }
 
-impl<R: ReaderAt> Bundle<R> {
+impl<R: ReaderAt + Sync> Bundle<R> {
     /// Construct a `Bundle` from a `ZipArchive`.
     pub fn from_archive(archive: ZipArchive<R>) -> Result<Self> {
         let info = BundleInfo::from_archive(&archive)?;
-        Ok(Self { info, archive })
+        Ok(Self {
+            info,
+            archive,
+            threads: NonZeroUsize::MIN,
+        })
+    }
+
+    /// Set the number of threads used to search log files for timestamps. Defaults to one.
+    pub fn with_threads(mut self, threads: NonZeroUsize) -> Self {
+        self.threads = threads;
+        self
     }
 
     /// List all ereports in the archive.
@@ -404,15 +416,46 @@ impl<R: ReaderAt> Bundle<R> {
         Ok(())
     }
 
-    /// Determine which of `logs` fall within `time`.
+    /// Determine which of `logs` fall within `time`, reading up to `self.threads` files at once.
     fn check_times(&self, logs: &[LogEntry], time: TimeRange) -> Result<Vec<bool>> {
-        let mut buf = Vec::with_capacity(TIME_CHECK_MAX as usize);
-        logs.iter()
-            .map(|log| {
-                let ts = self.log_timestamp(log, &mut buf)?;
-                Ok(ts.is_some_and(|ts| time.contains(ts)))
-            })
-            .collect()
+        let in_range: Vec<_> = logs.iter().map(|_| AtomicBool::new(false)).collect();
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let threads = self.threads.get().min(logs.len()).max(1);
+
+        thread::scope(|s| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    s.spawn(|| -> Result<()> {
+                        let mut buf = Vec::with_capacity(TIME_CHECK_MAX as usize);
+                        while !failed.load(Ordering::Relaxed) {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(log) = logs.get(i) else {
+                                break;
+                            };
+
+                            match self.log_timestamp(log, &mut buf) {
+                                Ok(ts) => in_range[i].store(
+                                    ts.is_some_and(|ts| time.contains(ts)),
+                                    Ordering::Relaxed,
+                                ),
+                                Err(e) => {
+                                    failed.store(true, Ordering::Relaxed);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+
+            workers
+                .into_iter()
+                .try_for_each(|worker| worker.join().unwrap())
+        })?;
+
+        Ok(in_range.into_iter().map(AtomicBool::into_inner).collect())
     }
 
     /// Find the log's timeframe, using `buf` to hold the start of the file.
