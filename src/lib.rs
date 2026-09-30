@@ -6,23 +6,29 @@
 
 use anyhow::{Context as _, Result};
 use bstr::ByteSlice;
+use flate2::bufread::DeflateDecoder;
 use glob::Pattern;
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
+use rawzip::{
+    CompressionMethod, ReaderAt, ZipArchive, ZipArchiveEntryWayfinder, ZipFileHeaderRecord,
+};
 use serde::Deserialize;
 use serde_json::Value;
-use zip::ZipArchive;
-use zip::read::ZipFile;
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::num::NonZeroUsize;
 use std::process::{Command, Stdio};
 use std::str;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
+
+/// How much of a log file to search for a timestamp.
+const TIME_CHECK_MAX: u64 = 1 << 16;
 
 /// Glob-pattern filters selecting ereports by hardware component.
 #[derive(Clone, Copy, Default, Debug)]
@@ -99,16 +105,16 @@ pub struct LogOutput<'a> {
 }
 
 #[derive(Debug)]
-struct LogFile {
-    path: String,
-    sled_uuid: String,
-    service: Option<String>,
-    zone: Option<String>,
+struct LogFile<'a> {
+    path: &'a str,
+    sled_uuid: &'a str,
+    service: Option<&'a str>,
+    zone: Option<&'a str>,
     timestamp: Option<i64>,
 }
 
-impl LogFile {
-    fn from_path(path: &str) -> Option<Self> {
+impl<'a> LogFile<'a> {
+    fn from_path(path: &'a str) -> Option<Self> {
         // Ignore directories.
         if path.ends_with('/') {
             return None;
@@ -122,16 +128,16 @@ impl LogFile {
             return None;
         }
 
-        let sled_uuid = parts.get(3)?.to_string();
+        let sled_uuid = parts.get(3)?;
 
-        let zone = parts.get(5).map(|s| s.to_string());
-        let service = parts.get(6).map(|s| s.to_string());
+        let zone = parts.get(5).copied();
+        let service = parts.get(6).copied();
 
         // Only archived logs have a trailing timestamp.
         let timestamp = Self::extract_timestamp(path);
 
         Some(LogFile {
-            path: path.to_string(),
+            path,
             sled_uuid,
             service,
             zone,
@@ -175,47 +181,68 @@ impl LogFile {
         if path_patterns.is_empty() {
             return true;
         }
-        path_patterns.iter().any(|p| p.matches(&self.path))
+        path_patterns.iter().any(|p| p.matches(self.path))
     }
+}
+
+/// The location of an entry's data within the archive, and how it is compressed.
+#[derive(Clone, Copy, Debug)]
+struct EntryLoc {
+    wayfinder: ZipArchiveEntryWayfinder,
+    method: CompressionMethod,
+}
+
+impl EntryLoc {
+    fn new(record: &ZipFileHeaderRecord<'_>) -> Self {
+        EntryLoc {
+            wayfinder: record.wayfinder(),
+            method: record.compression_method(),
+        }
+    }
+}
+
+/// A log file selected by the path-based filters, pending the time check.
+#[derive(Debug)]
+struct LogEntry {
+    loc: EntryLoc,
+    path: String,
+    /// The timestamp appended to the file name, only available for archived logs.
+    name_timestamp: Option<i64>,
+    /// The entry's modification time in the zip, only collected when filtering by time.
+    mtime: Option<Timestamp>,
 }
 
 /// An Oxide support bundle.
 pub struct Bundle<R> {
     info: BundleInfo,
-    archive: RefCell<ZipArchive<R>>,
+    archive: ZipArchive<R>,
+    threads: NonZeroUsize,
 }
 
-impl<R: Read + Seek> Bundle<R> {
+impl<R: ReaderAt + Sync> Bundle<R> {
     /// Construct a `Bundle` from a `ZipArchive`.
     pub fn from_archive(archive: ZipArchive<R>) -> Result<Self> {
-        let archive = RefCell::new(archive);
-        let info = BundleInfo::from_archive(&mut archive.borrow_mut())?;
-        Ok(Self { info, archive })
+        let info = BundleInfo::from_archive(&archive)?;
+        Ok(Self {
+            info,
+            archive,
+            threads: NonZeroUsize::MIN,
+        })
+    }
+
+    /// Set the number of threads used to search log files for timestamps. Defaults to one.
+    pub fn with_threads(mut self, threads: NonZeroUsize) -> Self {
+        self.threads = threads;
+        self
     }
 
     /// List all ereports in the archive.
     pub fn ereports_list<W: Write>(&self, components: ComponentInfo<'_>, mut out: W) -> Result<()> {
-        let archive = &mut self.archive.borrow_mut();
-
-        let ereports: Vec<_> = archive
-            .file_names()
-            .enumerate()
-            .filter_map(|(i, path)| {
-                let ereport = Ereport::from_path(path)?;
-
-                if matches_patterns(components.part, &ereport.part)
-                    && matches_patterns(components.serial, &ereport.serial)
-                {
-                    Some((i, ereport))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let ereports = self.matching_ereports(components)?;
 
         let max_ena_len = ereports
             .iter()
-            .map(|(_, ereport)| ereport.ena)
+            .map(|(_, _, ereport)| ereport.ena)
             .max()
             .map(|max| max.to_string().len())
             .unwrap_or(3);
@@ -225,11 +252,8 @@ impl<R: Read + Seek> Bundle<R> {
             "{:<11}\t{:<11}\t{:<36}\t{:<max_ena_len$}\tCLASS",
             "PART", "SERIAL", "RESTART_ID", "ENA",
         )?;
-        for (i, ereport) in ereports {
-            let mut file = archive
-                .by_index(i)
-                .with_context(|| format!("failed to access file index {i}"))?;
-            let contents = read_file_to_string(&mut file)?;
+        for (loc, path, ereport) in ereports {
+            let contents = read_to_string(&self.archive, loc, &path)?;
             let ereport_class = read_ereport_class(&contents);
 
             if let Some(ereport_class) = ereport_class
@@ -258,29 +282,8 @@ impl<R: Read + Seek> Bundle<R> {
         no_header: bool,
         mut out: W,
     ) -> Result<()> {
-        let archive = &mut self.archive.borrow_mut();
-        let matching_reports: Vec<_> = archive
-            .file_names()
-            .enumerate()
-            .filter_map(|(i, path)| {
-                let ereport = Ereport::from_path(path)?;
-
-                if matches_patterns(components.part, &ereport.part)
-                    && matches_patterns(components.serial, &ereport.serial)
-                {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for i in matching_reports {
-            let mut file = archive
-                .by_index(i)
-                .with_context(|| format!("failed to access file index {i}"))?;
-
-            let contents = read_file_to_string(&mut file)?;
+        for (loc, path, _) in self.matching_ereports(components)? {
+            let contents = read_to_string(&self.archive, loc, &path)?;
 
             if let Some(ereport_class) = read_ereport_class(&contents)
                 && !matches_patterns(components.class, ereport_class)
@@ -289,7 +292,7 @@ impl<R: Read + Seek> Bundle<R> {
             }
 
             if !no_header {
-                writeln!(out, "==> {} <==", file.name())?;
+                writeln!(out, "==> {path} <==")?;
             }
 
             if let Ok(json) = serde_json::from_str::<Value>(&contents)
@@ -316,78 +319,59 @@ impl<R: Read + Seek> Bundle<R> {
         output: LogOutput<'_>,
         mut out: W,
     ) -> Result<()> {
-        let archive = &mut self.archive.borrow_mut();
-        let matching_files: Vec<_> = archive
-            .file_names()
-            .enumerate()
-            .filter_map(|(i, name)| {
-                let log_file = LogFile::from_path(name)?;
-
-                let sled_info = self
-                    .info
-                    .sleds
-                    .get(&log_file.sled_uuid)
-                    .expect("BUG: UUID was not found in collected sled info");
-
-                if sled_info.matches_patterns(filter.sled)
-                    && log_file.matches_services(filter.service)
-                    && log_file.matches_zones(filter.zone)
-                    && log_file.matches_paths(filter.path)
-                {
-                    Some((i, log_file))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for (i, log) in matching_files {
-            let mut file = archive.by_index(i)?;
-
-            let time_check_buf = if time.is_set() {
-                const TIME_CHECK_MAX: u64 = 1 << 16;
-                let buf_size = file.size().min(TIME_CHECK_MAX) as usize;
-                let mut tc = vec![0u8; buf_size];
-
-                file.read_exact(&mut tc)
-                    .with_context(|| format!("failed to read file {}", file.name()))?;
-
-                // Try several methods of finding the log's timeframe, in order of decreasing accuracy:
-                // 1. Try to find a valid timestamp from the first 64k of the file.
-                // 2. Check for a the timestamp appended to the file name, only available for archived
-                //    logs.
-                // 3. Check the file's mtime in the zip, which will be available with R17.
-                // In all cases ignore times from before 2001, and skip any file where we cannot find a
-                // valid time.
-                let ts = read_timestamp_from_contents(&tc)
-                    .or_else(|| {
-                        let ts = log.timestamp?;
-                        Timestamp::from_second(ts).ok()
-                    })
-                    .or_else(|| {
-                        let zip_time = file.last_modified()?;
-                        let civil = jiff::civil::DateTime::try_from(zip_time).ok()?;
-                        civil.in_tz("UTC").ok().map(|t| t.timestamp())
-                    });
-
-                if !ts.is_some_and(|ts| time.contains(ts)) {
-                    continue;
-                }
-
-                // Only retain buffer if we'll need it for output
-                (!output.list).then_some(tc)
-            } else {
-                None
+        let mut logs = Vec::new();
+        for_each_entry(&self.archive, |name, record| {
+            let Some(log_file) = LogFile::from_path(name) else {
+                return Ok(());
             };
 
+            let sled_info = self
+                .info
+                .sleds
+                .get(log_file.sled_uuid)
+                .expect("BUG: UUID was not found in collected sled info");
+
+            if sled_info.matches_patterns(filter.sled)
+                && log_file.matches_services(filter.service)
+                && log_file.matches_zones(filter.zone)
+                && log_file.matches_paths(filter.path)
+            {
+                logs.push(LogEntry {
+                    loc: EntryLoc::new(record),
+                    path: name.to_string(),
+                    name_timestamp: log_file.timestamp,
+                    mtime: if time.is_set() {
+                        entry_mtime(record)
+                    } else {
+                        None
+                    },
+                });
+            }
+            Ok(())
+        })?;
+
+        let in_range = if time.is_set() {
+            Some(self.check_times(&logs, time)?)
+        } else {
+            None
+        };
+
+        for (i, log) in logs.iter().enumerate() {
+            if in_range.as_ref().is_some_and(|in_range| !in_range[i]) {
+                continue;
+            }
+
             if output.list {
-                writeln!(out, "{}", file.name())?;
+                writeln!(out, "{}", log.path)?;
                 continue;
             }
 
             if !output.no_header {
-                writeln!(out, "==> {} <==", file.name())?;
+                writeln!(out, "==> {} <==", log.path)?;
             }
+
+            let mut file = open_entry(&self.archive, log.loc)
+                .with_context(|| format!("failed to open file {}", log.path))?;
 
             if let Some(exec) = output.exec {
                 let shell = std::env::var("SHELL").unwrap_or("/bin/sh".to_string());
@@ -405,7 +389,6 @@ impl<R: Read + Seek> Bundle<R> {
                     let out_writer = s.spawn(|| io::copy(&mut child_out, &mut out));
 
                     let in_result = write_file_content(
-                        &time_check_buf,
                         &mut file,
                         &mut child_in,
                         output.line_ct.map(|l| l.get()),
@@ -422,12 +405,7 @@ impl<R: Read + Seek> Bundle<R> {
                     anyhow::bail!("command '{exec}' exited with {status}");
                 }
             } else {
-                write_file_content(
-                    &time_check_buf,
-                    &mut file,
-                    &mut out,
-                    output.line_ct.map(|l| l.get()),
-                )?;
+                write_file_content(&mut file, &mut out, output.line_ct.map(|l| l.get()))?;
             }
 
             if !output.no_header {
@@ -436,6 +414,85 @@ impl<R: Read + Seek> Bundle<R> {
         }
 
         Ok(())
+    }
+
+    /// Determine which of `logs` fall within `time`, reading up to `self.threads` files at once.
+    fn check_times(&self, logs: &[LogEntry], time: TimeRange) -> Result<Vec<bool>> {
+        let in_range: Vec<_> = logs.iter().map(|_| AtomicBool::new(false)).collect();
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let threads = self.threads.get().min(logs.len()).max(1);
+
+        thread::scope(|s| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    s.spawn(|| -> Result<()> {
+                        let mut buf = Vec::with_capacity(TIME_CHECK_MAX as usize);
+                        while !failed.load(Ordering::Relaxed) {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(log) = logs.get(i) else {
+                                break;
+                            };
+
+                            match self.log_timestamp(log, &mut buf) {
+                                Ok(ts) => in_range[i].store(
+                                    ts.is_some_and(|ts| time.contains(ts)),
+                                    Ordering::Relaxed,
+                                ),
+                                Err(e) => {
+                                    failed.store(true, Ordering::Relaxed);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+
+            workers
+                .into_iter()
+                .try_for_each(|worker| worker.join().unwrap())
+        })?;
+
+        Ok(in_range.into_iter().map(AtomicBool::into_inner).collect())
+    }
+
+    /// Find the log's timeframe, using `buf` to hold the start of the file.
+    fn log_timestamp(&self, log: &LogEntry, buf: &mut Vec<u8>) -> Result<Option<Timestamp>> {
+        buf.clear();
+        open_entry_unverified(&self.archive, log.loc)
+            .and_then(|file| Ok(file.take(TIME_CHECK_MAX).read_to_end(buf)?))
+            .with_context(|| format!("failed to read file {}", log.path))?;
+
+        // Try several methods of finding the log's timeframe, in order of decreasing accuracy:
+        // 1. Try to find a valid timestamp from the first 64k of the file.
+        // 2. Check for a the timestamp appended to the file name, only available for archived
+        //    logs.
+        // 3. Check the file's mtime in the zip, which will be available with R17.
+        // In all cases ignore times from before 2001, and skip any file where we cannot find a
+        // valid time.
+        Ok(read_timestamp_from_contents(buf)
+            .or_else(|| Timestamp::from_second(log.name_timestamp?).ok())
+            .or(log.mtime))
+    }
+
+    /// Find all ereports whose part and serial number match `components`.
+    fn matching_ereports(
+        &self,
+        components: ComponentInfo<'_>,
+    ) -> Result<Vec<(EntryLoc, String, Ereport)>> {
+        let mut ereports = Vec::new();
+        for_each_entry(&self.archive, |path, record| {
+            if let Some(ereport) = Ereport::from_path(path)
+                && matches_patterns(components.part, &ereport.part)
+                && matches_patterns(components.serial, &ereport.serial)
+            {
+                ereports.push((EntryLoc::new(record), path.to_string(), ereport));
+            }
+            Ok(())
+        })?;
+        Ok(ereports)
     }
 
     /// List all services with logs present in the archive.
@@ -542,72 +599,49 @@ struct BundleInfo {
 }
 
 impl BundleInfo {
-    pub fn from_archive<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Self> {
-        let mut sled_txt_indices = Vec::with_capacity(32);
+    pub fn from_archive<R: ReaderAt>(archive: &ZipArchive<R>) -> Result<Self> {
+        let mut sled_txts = Vec::with_capacity(32);
+        let mut sled_info_json = None;
 
         let mut sleds = BTreeMap::new();
         let mut sled_services = BTreeMap::new();
         let mut sled_zones = BTreeMap::new();
 
-        let mut splits = Vec::with_capacity(10);
-        for (i, name) in archive.file_names().enumerate() {
-            splits.clear();
+        for_each_entry(archive, |name, record| {
+            if name == "sled_info.json" {
+                sled_info_json = Some(EntryLoc::new(record));
+            }
+
+            if !name.starts_with("rack") {
+                return Ok(());
+            }
 
             // rack/{rack_uuid}/sled/{sled_uuid}/logs/{zone}/{service}/...
-            splits.extend(name.split('/'));
+            let splits: Vec<_> = name.split('/').collect();
 
             // The zone directory itself will have a length of 7, but we want zone directories that have at least one child.
             // Empty directories may exist for zones that don't actually exist on the sled, e.g., `oxz_switch`.
-            if name.starts_with("rack") && splits.len() == 8 {
-                let sled_uuid = splits[3];
-                let zone = splits[5];
-
-                let sled_entry = sled_zones.entry(sled_uuid).or_insert_with(BTreeSet::new);
-                sled_entry.insert(zone);
+            if splits.len() == 8 {
+                insert_nested(&mut sled_zones, splits[3], splits[5]);
             }
 
-            if name.starts_with("rack") && splits.len() == 9 {
-                let sled_uuid = splits[3];
-                let service = splits[6];
-
-                let sled_entry = sled_services.entry(sled_uuid).or_insert_with(BTreeSet::new);
-                sled_entry.insert(service);
+            if splits.len() == 9 {
+                insert_nested(&mut sled_services, splits[3], splits[6]);
             }
 
-            if name.starts_with("rack") && name.ends_with("sled.txt") && splits.len() == 5 {
-                sled_txt_indices.push(i);
+            if name.ends_with("sled.txt") && splits.len() == 5 {
+                sled_txts.push((EntryLoc::new(record), name.to_string()));
             }
-        }
+            Ok(())
+        })?;
 
-        let mut sled_services: BTreeMap<_, BTreeSet<_>> = sled_services
-            .into_iter()
-            .map(|(sled, services)| {
-                (
-                    sled.to_string(),
-                    services.into_iter().map(|s| s.to_string()).collect(),
-                )
-            })
-            .collect();
-        let mut sled_zones: BTreeMap<_, BTreeSet<_>> = sled_zones
-            .into_iter()
-            .map(|(sled, zones)| {
-                (
-                    sled.to_string(),
-                    zones.into_iter().map(|s| s.to_string()).collect(),
-                )
-            })
-            .collect();
-
-        for i in sled_txt_indices {
-            let mut file = archive.by_index(i)?;
-
-            let contents = read_file_to_string(&mut file)?;
-            let (serial, is_scrimlet) = read_sled_serial(&contents).ok_or_else(|| {
-                anyhow::anyhow!("failed to parse sled serial from {}", file.name())
-            })?;
+        for (loc, name) in sled_txts {
+            let contents = read_to_string(archive, loc, &name)?;
+            let (serial, is_scrimlet) = read_sled_serial(&contents)
+                .ok_or_else(|| anyhow::anyhow!("failed to parse sled serial from {name}"))?;
 
             // UNWRAP: We've confirmed above that the split length is five.
-            let uuid = file.name().split('/').nth(3).unwrap().to_string();
+            let uuid = name.split('/').nth(3).unwrap().to_string();
 
             let services = sled_services
                 .remove(&uuid)
@@ -633,7 +667,9 @@ impl BundleInfo {
         }
 
         let mut unhealthy_sleds = BTreeMap::new();
-        if let Ok(mut sled_info) = archive.by_name("sled_info.json") {
+        if let Some(loc) = sled_info_json
+            && let Ok(mut sled_info) = open_entry(archive, loc)
+        {
             #[derive(Deserialize, Debug)]
             struct SledId {
                 cubby: Option<u16>,
@@ -665,12 +701,90 @@ impl BundleInfo {
     }
 }
 
-fn read_file_to_string<R: Read>(file: &mut ZipFile<R>) -> Result<String> {
-    let mut buf = Vec::with_capacity(file.size() as usize);
-    file.read_to_end(&mut buf)
-        .with_context(|| format!("failed to read contents of {}", file.name()))?;
-    String::from_utf8(buf)
-        .with_context(|| format!("contents of {} were not valid UTF-8", file.name()))
+/// Call `f` with the name and central directory record of each entry in the archive.
+fn for_each_entry<R: ReaderAt>(
+    archive: &ZipArchive<R>,
+    mut f: impl FnMut(&str, &ZipFileHeaderRecord<'_>) -> Result<()>,
+) -> Result<()> {
+    let mut buf = vec![0u8; rawzip::RECOMMENDED_BUFFER_SIZE];
+    let mut entries = archive.entries(&mut buf);
+    while let Some(record) = entries
+        .next_entry()
+        .context("failed to read zip central directory")?
+    {
+        let path = record.file_path();
+        let name = String::from_utf8_lossy(path.as_ref());
+        f(&name, &record)?;
+    }
+    Ok(())
+}
+
+/// Open a reader over the decompressed contents of an entry. The CRC is verified if the entry is
+/// read to the end.
+fn open_entry<R: ReaderAt>(archive: &ZipArchive<R>, loc: EntryLoc) -> Result<Box<dyn Read + '_>> {
+    let entry = archive.get_entry(loc.wayfinder)?;
+    let reader = decompress(entry.reader(), loc.method)?;
+    Ok(Box::new(entry.verifying_reader(reader)))
+}
+
+/// Open a reader over the decompressed contents of an entry without verifying its CRC, for callers
+/// that will only read the start of the file.
+fn open_entry_unverified<R: ReaderAt>(
+    archive: &ZipArchive<R>,
+    loc: EntryLoc,
+) -> Result<Box<dyn Read + '_>> {
+    let entry = archive.get_entry(loc.wayfinder)?;
+    decompress(entry.reader(), loc.method)
+}
+
+fn decompress<'a>(raw: impl Read + 'a, method: CompressionMethod) -> Result<Box<dyn Read + 'a>> {
+    let raw = BufReader::new(raw);
+    let reader: Box<dyn Read + 'a> = match method {
+        CompressionMethod::STORE => Box::new(raw),
+        CompressionMethod::DEFLATE => Box::new(DeflateDecoder::new(raw)),
+        method => anyhow::bail!("unsupported compression method {method:?}"),
+    };
+    Ok(reader)
+}
+
+fn read_to_string<R: ReaderAt>(
+    archive: &ZipArchive<R>,
+    loc: EntryLoc,
+    name: &str,
+) -> Result<String> {
+    let mut buf = Vec::new();
+    open_entry(archive, loc)
+        .and_then(|mut file| Ok(file.read_to_end(&mut buf)?))
+        .with_context(|| format!("failed to read contents of {name}"))?;
+    String::from_utf8(buf).with_context(|| format!("contents of {name} were not valid UTF-8"))
+}
+
+/// The entry's modification time. DOS times carry no time zone, so treat them as UTC.
+fn entry_mtime(record: &ZipFileHeaderRecord<'_>) -> Option<Timestamp> {
+    let t = record.last_modified();
+    let civil = jiff::civil::DateTime::new(
+        i16::try_from(t.year()).ok()?,
+        i8::try_from(t.month()).ok()?,
+        i8::try_from(t.day()).ok()?,
+        i8::try_from(t.hour()).ok()?,
+        i8::try_from(t.minute()).ok()?,
+        i8::try_from(t.second()).ok()?,
+        i32::try_from(t.nanosecond()).ok()?,
+    )
+    .ok()?;
+    civil.to_zoned(TimeZone::UTC).ok().map(|t| t.timestamp())
+}
+
+fn insert_nested(map: &mut BTreeMap<String, BTreeSet<String>>, key: &str, value: &str) {
+    match map.get_mut(key) {
+        Some(set) if set.contains(value) => {}
+        Some(set) => {
+            set.insert(value.to_string());
+        }
+        None => {
+            map.insert(key.to_string(), BTreeSet::from([value.to_string()]));
+        }
+    }
 }
 
 fn read_sled_serial(sled_info: &str) -> Option<(String, bool)> {
@@ -784,40 +898,14 @@ struct LogTimestamp {
 }
 
 fn write_file_content<R: Read, W: Write>(
-    time_check_buf: &Option<Vec<u8>>,
     file: &mut R,
     out: &mut W,
     line_ct: Option<usize>,
 ) -> io::Result<()> {
-    if let Some(line_ct) = line_ct {
-        let (cached_lines, ending_offset) = time_check_buf
-            .as_ref()
-            .map(|tc| {
-                let mut cached = 0;
-                let mut end = 0;
-                for i in tc.find_iter(b"\n").take(line_ct) {
-                    cached += 1;
-                    end = i;
-                }
-                (cached, end)
-            })
-            .unwrap_or((0, 0));
-
-        match time_check_buf {
-            Some(tc) if cached_lines == line_ct => out.write_all(&tc[..=ending_offset])?,
-            Some(tc) => {
-                out.write_all(tc)?;
-                write_n_lines(file, out, line_ct - cached_lines)?;
-            }
-            None => write_n_lines(file, out, line_ct)?,
-        }
-    } else {
-        if let Some(tc) = time_check_buf {
-            out.write_all(tc)?;
-        }
-        io::copy(file, out)?;
+    match line_ct {
+        Some(line_ct) => write_n_lines(file, out, line_ct),
+        None => io::copy(file, out).map(|_| ()),
     }
-    Ok(())
 }
 
 fn write_n_lines<R: Read, W: Write>(
@@ -1132,14 +1220,24 @@ mod tests {
         ]
     }
 
-    fn build_zip(buf: &mut Vec<u8>) -> ZipArchive<Cursor<&mut Vec<u8>>> {
-        let mut zip = ZipWriter::new(Cursor::new(buf));
+    fn build_zip(buf: &mut Vec<u8>) -> ZipArchive<Cursor<&[u8]>> {
+        let mut zip = ZipWriter::new(Cursor::new(&mut *buf));
 
+        // Alternate between stored and deflated files, as found in real bundles, so that each kind
+        // of file is read through both paths.
+        let mut deflate = false;
         for file in zip_files() {
             let options = SimpleFileOptions::default()
                 .compression_method(CompressionMethod::Stored)
                 .last_modified_time(file.mtime.unwrap_or_default());
             if let Some(contents) = file.contents {
+                let options = if deflate {
+                    options.compression_method(CompressionMethod::Deflated)
+                } else {
+                    options
+                };
+                deflate = !deflate;
+
                 zip.start_file(file.name, options).unwrap();
                 zip.write_all(contents.as_bytes()).unwrap();
                 zip.write_all(b"\n").unwrap();
@@ -1148,7 +1246,11 @@ mod tests {
             }
         }
 
-        zip.finish_into_readable().unwrap()
+        zip.finish().unwrap();
+
+        ZipArchive::from_slice(&buf[..])
+            .unwrap()
+            .into_cursor_archive()
     }
 
     #[test]
@@ -1553,8 +1655,9 @@ mod tests {
             zip.finish().unwrap();
         }
 
-        let cursor = Cursor::new(&mut buf);
-        let archive = ZipArchive::new(cursor).unwrap();
+        let archive = ZipArchive::from_slice(&buf[..])
+            .unwrap()
+            .into_cursor_archive();
         let bundle = Bundle::from_archive(archive).unwrap();
 
         let mut out = Vec::new();
