@@ -15,6 +15,7 @@ use rawzip::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use zstd::zstd_safe::{DCtx, ResetDirective};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufReader, Read, Write};
@@ -273,8 +274,9 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             "{:<11}\t{:<11}\t{:<36}\t{:<max_ena_len$}\tCLASS",
             "PART", "SERIAL", "RESTART_ID", "ENA",
         )?;
+        let mut dctx = DCtx::create();
         for (loc, path, ereport) in ereports {
-            let contents = read_to_string(&self.archive, loc, &path)?;
+            let contents = read_to_string(&self.archive, loc, &path, &mut dctx)?;
             let ereport_class = read_ereport_class(&contents);
 
             if let Some(ereport_class) = ereport_class
@@ -303,8 +305,9 @@ impl<R: ReaderAt + Sync> Bundle<R> {
         no_header: bool,
         mut out: W,
     ) -> Result<()> {
+        let mut dctx = DCtx::create();
         for (loc, path, _) in self.matching_ereports(components)? {
-            let contents = read_to_string(&self.archive, loc, &path)?;
+            let contents = read_to_string(&self.archive, loc, &path, &mut dctx)?;
 
             if let Some(ereport_class) = read_ereport_class(&contents)
                 && !matches_patterns(components.class, ereport_class)
@@ -377,6 +380,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             None
         };
 
+        let mut dctx = DCtx::create();
         for (i, log) in logs.iter().enumerate() {
             if in_range.as_ref().is_some_and(|in_range| !in_range[i]) {
                 continue;
@@ -391,7 +395,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
                 writeln!(out, "==> {} <==", log.path)?;
             }
 
-            let mut file = open_entry(&self.archive, log.loc)
+            let mut file = open_entry(&self.archive, log.loc, &mut dctx)
                 .with_context(|| format!("failed to open file {}", log.path))?;
 
             if let Some(exec) = output.exec {
@@ -450,13 +454,14 @@ impl<R: ReaderAt + Sync> Bundle<R> {
                 .map(|_| {
                     s.spawn(|| -> Result<()> {
                         let mut buf = Vec::with_capacity(TIME_CHECK_MAX as usize);
+                        let mut dctx = DCtx::create();
                         while !failed.load(Ordering::Relaxed) {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             let Some(log) = logs.get(i) else {
                                 break;
                             };
 
-                            match self.log_timestamp(log, &mut buf) {
+                            match self.log_timestamp(log, &mut buf, &mut dctx) {
                                 Ok(ts) => in_range[i].store(
                                     ts.is_some_and(|ts| time.contains(ts)),
                                     Ordering::Relaxed,
@@ -480,10 +485,15 @@ impl<R: ReaderAt + Sync> Bundle<R> {
         Ok(in_range.into_iter().map(AtomicBool::into_inner).collect())
     }
 
-    /// Find the log's timeframe, using `buf` to hold the start of the file.
-    fn log_timestamp(&self, log: &LogEntry, buf: &mut Vec<u8>) -> Result<Option<Timestamp>> {
+    /// Find the log's timeframe, using `buf` to hold the start of the file and `dctx` to decode it.
+    fn log_timestamp(
+        &self,
+        log: &LogEntry,
+        buf: &mut Vec<u8>,
+        dctx: &mut DCtx<'static>,
+    ) -> Result<Option<Timestamp>> {
         buf.clear();
-        open_entry_unverified(&self.archive, log.loc)
+        open_entry_unverified(&self.archive, log.loc, dctx)
             .and_then(|file| Ok(file.take(TIME_CHECK_MAX).read_to_end(buf)?))
             .with_context(|| format!("failed to read file {}", log.path))?;
 
@@ -657,8 +667,9 @@ impl BundleInfo {
             Ok(())
         })?;
 
+        let mut dctx = DCtx::create();
         for (loc, name) in sled_txts {
-            let contents = read_to_string(archive, loc, &name)?;
+            let contents = read_to_string(archive, loc, &name, &mut dctx)?;
             let (serial, is_scrimlet) = read_sled_serial(&contents)
                 .ok_or_else(|| anyhow::anyhow!("failed to parse sled serial from {name}"))?;
 
@@ -690,7 +701,7 @@ impl BundleInfo {
 
         let mut unhealthy_sleds = BTreeMap::new();
         if let Some(loc) = sled_info_json
-            && let Ok(mut sled_info) = open_entry(archive, loc)
+            && let Ok(mut sled_info) = open_entry(archive, loc, &mut dctx)
         {
             #[derive(Deserialize, Debug)]
             struct SledId {
@@ -741,24 +752,29 @@ fn for_each_entry<R: ReaderAt>(
     Ok(())
 }
 
-/// Open a reader over the decompressed contents of an entry. The CRC is verified if the entry is
-/// read to the end.
-fn open_entry<R: ReaderAt>(archive: &ZipArchive<R>, loc: EntryLoc) -> Result<Box<dyn Read + '_>> {
+/// Open a reader over the decompressed contents of an entry, decoding zstd files with `dctx`. The
+/// CRC is verified if the entry is read to the end.
+fn open_entry<'a, R: ReaderAt>(
+    archive: &'a ZipArchive<R>,
+    loc: EntryLoc,
+    dctx: &'a mut DCtx<'static>,
+) -> Result<Box<dyn Read + 'a>> {
     let entry = archive.get_entry(loc.wayfinder)?;
     let reader = decompress(entry.reader(), loc.method)?;
     // The CRC covers the entry as stored, i.e. the compressed bytes of a zstd file, so verify
     // before decoding it. The decoder reads until EOF, letting the verifier see the end.
-    decompress_zstd(entry.verifying_reader(reader), loc.zstd)
+    decompress_zstd(entry.verifying_reader(reader), loc.zstd, dctx)
 }
 
 /// Open a reader over the decompressed contents of an entry without verifying its CRC, for callers
 /// that will only read the start of the file.
-fn open_entry_unverified<R: ReaderAt>(
-    archive: &ZipArchive<R>,
+fn open_entry_unverified<'a, R: ReaderAt>(
+    archive: &'a ZipArchive<R>,
     loc: EntryLoc,
-) -> Result<Box<dyn Read + '_>> {
+    dctx: &'a mut DCtx<'static>,
+) -> Result<Box<dyn Read + 'a>> {
     let entry = archive.get_entry(loc.wayfinder)?;
-    decompress_zstd(decompress(entry.reader(), loc.method)?, loc.zstd)
+    decompress_zstd(decompress(entry.reader(), loc.method)?, loc.zstd, dctx)
 }
 
 fn decompress<'a>(raw: impl Read + 'a, method: CompressionMethod) -> Result<Box<dyn Read + 'a>> {
@@ -772,21 +788,40 @@ fn decompress<'a>(raw: impl Read + 'a, method: CompressionMethod) -> Result<Box<
 }
 
 /// Decode a file that was compressed with zstd before being added to the zip, if `zstd` is set.
-fn decompress_zstd<'a>(reader: impl Read + 'a, zstd: bool) -> Result<Box<dyn Read + 'a>> {
-    if zstd {
-        Ok(Box::new(zstd::Decoder::new(reader)?))
-    } else {
-        Ok(Box::new(reader))
+///
+/// Callers pass in a `dctx` that they reuse from file to file. Creating a decoder per file would
+/// allocate its buffers, sized for the window of up to several MiB, each time, which adds
+/// noticeably to the cost of reading the start of many small logs.
+fn decompress_zstd<'a>(
+    reader: impl Read + 'a,
+    zstd: bool,
+    dctx: &'a mut DCtx<'static>,
+) -> Result<Box<dyn Read + 'a>> {
+    if !zstd {
+        return Ok(Box::new(reader));
     }
+
+    // Discard any frame the last file using `dctx` stopped partway through.
+    dctx.reset(ResetDirective::SessionOnly).map_err(|code| {
+        anyhow::anyhow!(
+            "failed to reset zstd decoder: {}",
+            zstd::zstd_safe::get_error_name(code)
+        )
+    })?;
+    Ok(Box::new(zstd::Decoder::with_context(
+        BufReader::new(reader),
+        dctx,
+    )))
 }
 
 fn read_to_string<R: ReaderAt>(
     archive: &ZipArchive<R>,
     loc: EntryLoc,
     name: &str,
+    dctx: &mut DCtx<'static>,
 ) -> Result<String> {
     let mut buf = Vec::new();
-    open_entry(archive, loc)
+    open_entry(archive, loc, dctx)
         .and_then(|mut file| Ok(file.read_to_end(&mut buf)?))
         .with_context(|| format!("failed to read contents of {name}"))?;
     String::from_utf8(buf).with_context(|| format!("contents of {name} were not valid UTF-8"))
@@ -1682,6 +1717,81 @@ mod tests {
                 zstd_out.replace(ZSTD_SUFFIX, ""),
                 String::from_utf8(plain_out).unwrap(),
                 "{filter:?} {time:?} {output:?}"
+            );
+        }
+    }
+
+    /// Reading only the start of a large zstd log leaves its frame partly decoded, which must not
+    /// affect the next log decoded with the same context.
+    #[test]
+    fn test_logs_zstd_partial_read() {
+        let big_log = (0..20_000)
+            .map(|i| {
+                format!(
+                    r#"{{"msg":"line {i}","time":"2025-09-24T07:00:00Z","n":{}}}"#,
+                    i * 7919
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Place the big log ahead of the others, so that they are read after it.
+        let files = || {
+            let mut files = zip_files();
+            let first_log = files
+                .iter()
+                .position(|f| f.name.contains("/logs/") && f.contents.is_some())
+                .unwrap();
+            files.insert(
+                first_log,
+                ZipFile {
+                    name: "rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758700000",
+                    contents: Some(big_log.clone()),
+                    ..Default::default()
+                },
+            );
+            files
+        };
+
+        let mut plain_buf = Vec::new();
+        let plain = Bundle::from_archive(build_zip_from(&mut plain_buf, files(), false)).unwrap();
+
+        let mut zstd_buf = Vec::new();
+        let zstd = Bundle::from_archive(build_zip_from(&mut zstd_buf, files(), true)).unwrap();
+
+        let cases = [
+            (
+                TimeRange::default(),
+                LogOutput {
+                    line_ct: Some(NonZeroUsize::new(1).unwrap()),
+                    ..Default::default()
+                },
+            ),
+            (
+                TimeRange {
+                    after: Some("2025-09-24T06:00:00.0Z".parse::<Timestamp>().unwrap()),
+                    ..Default::default()
+                },
+                LogOutput::default(),
+            ),
+        ];
+
+        for (time, output) in cases {
+            let mut plain_out = Vec::new();
+            plain
+                .logs(LogFilter::default(), time, output, &mut plain_out)
+                .unwrap();
+
+            let mut zstd_out = Vec::new();
+            zstd.logs(LogFilter::default(), time, output, &mut zstd_out)
+                .unwrap();
+
+            assert_eq!(
+                String::from_utf8(zstd_out)
+                    .unwrap()
+                    .replace(ZSTD_SUFFIX, ""),
+                String::from_utf8(plain_out).unwrap(),
+                "{time:?} {output:?}"
             );
         }
     }
