@@ -20,8 +20,14 @@ use std::process;
 
 use bundle_cat::{Bundle, ComponentInfo, LogFilter, LogOutput, TimeRange};
 
-/// Upper bound on the number of threads used to search logs for timestamps.
+/// Upper bound on the number of threads used to search logs for timestamps. The search stops
+/// scaling well past six threads.
 const MAX_THREADS: NonZeroUsize = NonZeroUsize::new(6).unwrap();
+
+/// Upper bound on the number of `--exec` commands run at once, as many as the threads searching
+/// for timestamps. Each command running ahead of the output may hold up to 1 MiB of its output,
+/// plus a zstd decoder of a few MiB for its file.
+const MAX_EXEC_JOBS: NonZeroUsize = NonZeroUsize::new(6).unwrap();
 
 /// How much output to collect before writing it to standard output.
 const OUTPUT_BUFFER_SIZE: usize = 256 << 10;
@@ -214,13 +220,11 @@ fn run() -> Result<()> {
 }
 
 fn run_command<R: ReaderAt + Sync>(args: &Cli, archive: ZipArchive<R>) -> Result<()> {
-    // Searching logs for timestamps stops scaling well past six threads.
-    let threads = std::thread::available_parallelism()
-        .unwrap_or(NonZeroUsize::MIN)
-        .min(MAX_THREADS);
+    let parallelism = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
     let bundle = Bundle::from_archive(archive)
         .context("failed to parse sled information from bundle")?
-        .with_threads(threads);
+        .with_threads(parallelism.min(MAX_THREADS))
+        .with_exec_jobs(parallelism.min(MAX_EXEC_JOBS));
 
     // Standard output is line buffered, which would make a system call for nearly every write.
     let out = BufWriter::with_capacity(OUTPUT_BUFFER_SIZE, io::stdout());

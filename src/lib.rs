@@ -17,13 +17,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use zstd::zstd_safe::{DCtx, ResetDirective};
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, BufReader, Read, Write};
 use std::num::NonZeroUsize;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::str;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, ScopedJoinHandle};
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
@@ -34,6 +35,11 @@ const TIME_CHECK_MAX: u64 = 1 << 16;
 /// How much of a log file to read first when searching it for a timestamp. Most logs have one on
 /// their first line, so reading more is usually wasted.
 const TIME_CHECK_STEP: u64 = 1 << 12;
+
+/// How much output an `exec` command running ahead may produce before it must wait for its
+/// output to be written. Commands for files with little output finish well ahead, while ones with
+/// a lot are held to this much memory each.
+const EXEC_BUFFER_SIZE: usize = 1 << 20;
 
 /// The suffix of files compressed with zstd before being added to the bundle.
 const ZSTD_SUFFIX: &str = ".zst";
@@ -238,11 +244,143 @@ struct LogEntry {
     mtime: Option<Timestamp>,
 }
 
+/// An `--exec` command started on a log file, whose output is waiting to be written.
+struct ExecJob<'scope, 'env> {
+    log: &'env LogEntry,
+    child: Child,
+    pending: Arc<PendingOutput>,
+    /// The thread writing the file to the command's input.
+    feeder: Option<ScopedJoinHandle<'scope, Result<()>>>,
+}
+
+impl ExecJob<'_, '_> {
+    /// Write the command's output, as it arrives, and check that it succeeded.
+    fn finish(mut self, exec: &str, no_header: bool, out: &mut impl Write) -> Result<()> {
+        if !no_header {
+            writeln!(out, "==> {} <==", self.log.path)?;
+        }
+
+        let copied = (|| -> io::Result<()> {
+            while let Some(chunk) = self.pending.take() {
+                out.write_all(&chunk?)?;
+            }
+            Ok(())
+        })();
+        // Return before waiting on the feeder if output failed, as the command may be blocked on
+        // output that will no longer be read, and the feeder in turn on the command. Dropping the
+        // job stops the command.
+        copied.with_context(|| format!("failed to copy file {}", self.log.path))?;
+        if let Some(feeder) = self.feeder.take() {
+            feeder.join().unwrap()?;
+        }
+
+        let status = self.child.wait()?;
+        if !status.success() {
+            anyhow::bail!("command '{exec}' exited with {status}");
+        }
+
+        if !no_header {
+            writeln!(out)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ExecJob<'_, '_> {
+    /// Stop a command whose output will not be written, after an error, so that the threads
+    /// feeding and reading it can finish.
+    fn drop(&mut self) {
+        self.pending.cancel();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Output read from an `--exec` command that has yet to be written, passed from the thread
+/// reading it to the one writing it.
+struct PendingOutput {
+    state: Mutex<PendingState>,
+    changed: Condvar,
+    /// Stop reading the command's output while this many bytes are waiting.
+    limit: usize,
+}
+
+#[derive(Default)]
+struct PendingState {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// How reading ended, once the command's output has closed.
+    done: Option<io::Result<()>>,
+    cancelled: bool,
+}
+
+impl PendingOutput {
+    fn new(limit: usize) -> Self {
+        PendingOutput {
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            limit,
+        }
+    }
+
+    /// Read `reader` to the end, holding its output until it is taken. While `limit` bytes are
+    /// waiting, stop reading, so that a command with more to write blocks on its full pipe.
+    fn fill_from(&self, mut reader: impl Read) {
+        let mut buf = vec![0; 64 << 10];
+        let result = loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => break Err(e),
+            };
+
+            let mut state = self.state.lock().unwrap();
+            while state.bytes > 0 && state.bytes >= self.limit && !state.cancelled {
+                state = self.changed.wait(state).unwrap();
+            }
+            if state.cancelled {
+                return;
+            }
+            state.bytes += n;
+            state.chunks.push_back(buf[..n].to_vec());
+            self.changed.notify_all();
+        };
+
+        self.state.lock().unwrap().done = Some(result);
+        self.changed.notify_all();
+    }
+
+    /// Take the next chunk of output, waiting for one. Returns `None` once all of it is taken.
+    fn take(&self) -> Option<io::Result<Vec<u8>>> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(chunk) = state.chunks.pop_front() {
+                state.bytes -= chunk.len();
+                self.changed.notify_all();
+                return Some(Ok(chunk));
+            }
+            if let Some(done) = state.done.take() {
+                return done.err().map(Err);
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn cancel(&self) {
+        self.state.lock().unwrap().cancelled = true;
+        self.changed.notify_all();
+    }
+}
+
 /// An Oxide support bundle.
 pub struct Bundle<R> {
     info: BundleInfo,
     archive: ZipArchive<R>,
     threads: NonZeroUsize,
+    exec_jobs: NonZeroUsize,
+    /// How much output each `--exec` command may produce ahead of it being written.
+    exec_buffer: usize,
 }
 
 impl<R: ReaderAt + Sync> Bundle<R> {
@@ -253,12 +391,21 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             info,
             archive,
             threads: NonZeroUsize::MIN,
+            exec_jobs: NonZeroUsize::MIN,
+            exec_buffer: EXEC_BUFFER_SIZE,
         })
     }
 
     /// Set the number of threads used to search log files for timestamps. Defaults to one.
     pub fn with_threads(mut self, threads: NonZeroUsize) -> Self {
         self.threads = threads;
+        self
+    }
+
+    /// Set the number of `exec` commands run at once, so that later files' commands run while
+    /// earlier files' output is written. Defaults to one.
+    pub fn with_exec_jobs(mut self, jobs: NonZeroUsize) -> Self {
+        self.exec_jobs = jobs;
         self
     }
 
@@ -386,67 +533,111 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             None
         };
 
-        let mut dctx = DCtx::create();
-        for (i, log) in logs.iter().enumerate() {
-            if in_range.as_ref().is_some_and(|in_range| !in_range[i]) {
-                continue;
-            }
+        let selected = logs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| in_range.as_ref().is_none_or(|in_range| in_range[*i]))
+            .map(|(_, log)| log);
 
-            if output.list {
-                writeln!(out, "{}", log.path)?;
-                continue;
-            }
-
-            if !output.no_header {
-                writeln!(out, "==> {} <==", log.path)?;
-            }
-
-            let mut file = open_entry(&self.archive, log.loc, &mut dctx)
-                .with_context(|| format!("failed to open file {}", log.path))?;
-
-            if let Some(exec) = output.exec {
-                let shell = std::env::var("SHELL").unwrap_or("/bin/sh".to_string());
-                let mut child = Command::new(&shell)
-                    .arg("-c")
-                    .arg(exec)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .spawn()?;
-
-                let mut child_in = child.stdin.take().unwrap();
-                let mut child_out = child.stdout.take().unwrap();
-
-                let copy_result = thread::scope(|s| {
-                    let out_writer = s.spawn(|| io::copy(&mut child_out, &mut out));
-
-                    let in_result = write_file_content(
-                        &mut file,
-                        &mut child_in,
-                        output.line_ct.map(|l| l.get()),
-                    );
-                    drop(child_in); // EOF.
-
-                    let out_result = out_writer.join().unwrap();
-                    in_result.and(out_result)
-                });
-                copy_result.with_context(|| format!("failed to copy file {}", log.path))?;
-
-                let status = child.wait()?;
-                if !status.success() {
-                    anyhow::bail!("command '{exec}' exited with {status}");
+        if let Some(exec) = output.exec
+            && !output.list
+        {
+            self.exec_logs(selected, exec, output, &mut out)?;
+        } else {
+            let mut dctx = DCtx::create();
+            for log in selected {
+                if output.list {
+                    writeln!(out, "{}", log.path)?;
+                    continue;
                 }
-            } else {
+
+                if !output.no_header {
+                    writeln!(out, "==> {} <==", log.path)?;
+                }
+
+                let mut file = open_entry(&self.archive, log.loc, &mut dctx)
+                    .with_context(|| format!("failed to open file {}", log.path))?;
                 write_file_content(&mut file, &mut out, output.line_ct.map(|l| l.get()))
                     .with_context(|| format!("failed to copy file {}", log.path))?;
-            }
 
-            if !output.no_header {
-                writeln!(out)?;
+                if !output.no_header {
+                    writeln!(out)?;
+                }
             }
         }
 
         out.flush()?;
         Ok(())
+    }
+
+    /// Pipe each of `logs` through `exec` and write each command's output in turn. Up to
+    /// `self.exec_jobs` commands run at once, so that the output for the next files is ready, or
+    /// partly so, by the time it is written.
+    fn exec_logs<'l, W: Write + Send>(
+        &self,
+        mut logs: impl Iterator<Item = &'l LogEntry>,
+        exec: &str,
+        output: LogOutput<'_>,
+        mut out: W,
+    ) -> Result<()> {
+        let shell = std::env::var("SHELL").unwrap_or("/bin/sh".to_string());
+        let jobs = self.exec_jobs.get();
+
+        thread::scope(|s| {
+            let mut running = VecDeque::with_capacity(jobs);
+            loop {
+                while running.len() < jobs
+                    && let Some(log) = logs.next()
+                {
+                    running.push_back(self.start_exec(s, log, &shell, exec, output)?);
+                }
+
+                let Some(job) = running.pop_front() else {
+                    return Ok(());
+                };
+                job.finish(exec, output.no_header, &mut out)?;
+            }
+        })
+    }
+
+    /// Start `exec` on `log`, with threads to feed it the file and collect its output.
+    fn start_exec<'scope, 'env>(
+        &'env self,
+        s: &'scope thread::Scope<'scope, 'env>,
+        log: &'env LogEntry,
+        shell: &str,
+        exec: &str,
+        output: LogOutput<'_>,
+    ) -> Result<ExecJob<'scope, 'env>> {
+        let mut child = Command::new(shell)
+            .arg("-c")
+            .arg(exec)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let mut child_in = child.stdin.take().unwrap();
+        let child_out = child.stdout.take().unwrap();
+
+        let line_ct = output.line_ct.map(|l| l.get());
+        let feeder = s.spawn(move || -> Result<()> {
+            let mut dctx = DCtx::create();
+            let mut file = open_entry(&self.archive, log.loc, &mut dctx)
+                .with_context(|| format!("failed to open file {}", log.path))?;
+            write_file_content(&mut file, &mut child_in, line_ct)
+                .with_context(|| format!("failed to copy file {}", log.path))
+            // Dropping `child_in` closes the command's input.
+        });
+
+        let pending = Arc::new(PendingOutput::new(self.exec_buffer));
+        let collector = Arc::clone(&pending);
+        s.spawn(move || collector.fill_from(child_out));
+
+        Ok(ExecJob {
+            log,
+            child,
+            pending,
+            feeder: Some(feeder),
+        })
     }
 
     /// Determine which of `logs` fall within `time`, reading up to `self.threads` files at once.
@@ -1344,6 +1535,34 @@ mod tests {
         build_zip_from(buf, zip_files(), false)
     }
 
+    /// The test files with a log of about 1.2 MiB, several zstd blocks, ahead of the other logs.
+    fn zip_files_with_big_log() -> Vec<ZipFile> {
+        let big_log = (0..20_000)
+            .map(|i| {
+                format!(
+                    r#"{{"msg":"line {i}","time":"2025-09-24T07:00:00Z","n":{}}}"#,
+                    i * 7919
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut files = zip_files();
+        let first_log = files
+            .iter()
+            .position(|f| f.name.contains("/logs/") && f.contents.is_some())
+            .unwrap();
+        files.insert(
+            first_log,
+            ZipFile {
+                name: "rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758700000",
+                contents: Some(big_log),
+                ..Default::default()
+            },
+        );
+        files
+    }
+
     /// Build a zip of `files`. With `zstd_logs`, each file under a "logs/" directory is
     /// compressed with zstd and given a ".zst" suffix, as in newer bundles.
     fn build_zip_from(
@@ -1777,39 +1996,21 @@ mod tests {
     /// affect the next log decoded with the same context.
     #[test]
     fn test_logs_zstd_partial_read() {
-        let big_log = (0..20_000)
-            .map(|i| {
-                format!(
-                    r#"{{"msg":"line {i}","time":"2025-09-24T07:00:00Z","n":{}}}"#,
-                    i * 7919
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Place the big log ahead of the others, so that they are read after it.
-        let files = || {
-            let mut files = zip_files();
-            let first_log = files
-                .iter()
-                .position(|f| f.name.contains("/logs/") && f.contents.is_some())
-                .unwrap();
-            files.insert(
-                first_log,
-                ZipFile {
-                    name: "rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758700000",
-                    contents: Some(big_log.clone()),
-                    ..Default::default()
-                },
-            );
-            files
-        };
-
         let mut plain_buf = Vec::new();
-        let plain = Bundle::from_archive(build_zip_from(&mut plain_buf, files(), false)).unwrap();
+        let plain = Bundle::from_archive(build_zip_from(
+            &mut plain_buf,
+            zip_files_with_big_log(),
+            false,
+        ))
+        .unwrap();
 
         let mut zstd_buf = Vec::new();
-        let zstd = Bundle::from_archive(build_zip_from(&mut zstd_buf, files(), true)).unwrap();
+        let zstd = Bundle::from_archive(build_zip_from(
+            &mut zstd_buf,
+            zip_files_with_big_log(),
+            true,
+        ))
+        .unwrap();
 
         let cases = [
             (
@@ -1844,6 +2045,132 @@ mod tests {
                     .replace(ZSTD_SUFFIX, ""),
                 String::from_utf8(plain_out).unwrap(),
                 "{time:?} {output:?}"
+            );
+        }
+    }
+
+    /// Running `exec` commands ahead of output prints the same as running them one at a time,
+    /// including when commands fill their buffers and wait for their output to be written.
+    #[test]
+    fn test_logs_exec_jobs() {
+        let jobs = NonZeroUsize::new(4).unwrap();
+        for zstd_logs in [false, true] {
+            let mut buf = Vec::new();
+            build_zip_from(&mut buf, zip_files_with_big_log(), zstd_logs);
+            let bundle = || {
+                let archive = ZipArchive::from_slice(&buf[..])
+                    .unwrap()
+                    .into_cursor_archive();
+                Bundle::from_archive(archive).unwrap()
+            };
+
+            for exec in ["cat", "wc -l", "tail -n 2"] {
+                let run = |bundle: Bundle<_>| {
+                    let mut out = Vec::new();
+                    let output = LogOutput {
+                        exec: Some(exec),
+                        ..Default::default()
+                    };
+                    bundle
+                        .logs(LogFilter::default(), TimeRange::default(), output, &mut out)
+                        .unwrap();
+                    String::from_utf8(out).unwrap()
+                };
+
+                let one_at_a_time = run(bundle());
+                let ahead = run(bundle().with_exec_jobs(jobs));
+                // Hold back each command after its first read of output.
+                let mut held = bundle().with_exec_jobs(jobs);
+                held.exec_buffer = 0;
+                let held = run(held);
+
+                assert!(one_at_a_time.lines().count() > 10, "{exec}");
+                assert_eq!(ahead, one_at_a_time, "{exec}, zstd: {zstd_logs}");
+                assert_eq!(held, one_at_a_time, "{exec}, zstd: {zstd_logs}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_logs_exec_failure() {
+        let mut buf = Vec::new();
+        let bundle = Bundle::from_archive(build_zip_from(&mut buf, zip_files_with_big_log(), true))
+            .unwrap()
+            .with_exec_jobs(NonZeroUsize::new(4).unwrap());
+
+        let exec = "cat > /dev/null; false";
+        let err = bundle
+            .logs(
+                LogFilter::default(),
+                TimeRange::default(),
+                LogOutput {
+                    exec: Some(exec),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("command '{exec}' exited with")),
+            "{err:#}"
+        );
+    }
+
+    /// A writer that fails once `limit` bytes are written, as standard output does once the
+    /// command reading it exits.
+    struct ClosingWriter {
+        written: usize,
+        limit: usize,
+    }
+
+    impl Write for ClosingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written >= self.limit {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            let n = buf.len().min(self.limit - self.written);
+            self.written += n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Writing output fails partway through a large file, while commands are blocked writing
+    /// their output. They are stopped, rather than left for `logs` to wait on forever.
+    #[test]
+    fn test_logs_exec_output_closed() {
+        for jobs in [1, 4] {
+            let mut buf = Vec::new();
+            let mut bundle =
+                Bundle::from_archive(build_zip_from(&mut buf, zip_files_with_big_log(), true))
+                    .unwrap()
+                    .with_exec_jobs(NonZeroUsize::new(jobs).unwrap());
+            // Hold back each command after its first read of output, so that `cat` blocks well
+            // before reading all of the big log.
+            bundle.exec_buffer = 0;
+
+            let err = bundle
+                .logs(
+                    LogFilter::default(),
+                    TimeRange::default(),
+                    LogOutput {
+                        exec: Some("cat"),
+                        ..Default::default()
+                    },
+                    ClosingWriter {
+                        written: 0,
+                        limit: 1000,
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<io::Error>().map(io::Error::kind),
+                Some(io::ErrorKind::BrokenPipe),
+                "jobs: {jobs}, {err:#}"
             );
         }
     }
