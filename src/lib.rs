@@ -755,8 +755,13 @@ fn for_each_entry<R: ReaderAt>(
         .context("failed to read zip central directory")?
     {
         let path = record.file_path();
-        let name = String::from_utf8_lossy(path.as_ref());
-        f(&name, &record)?;
+        let path: &[u8] = path.as_ref();
+        // Names are nearly always valid UTF-8, which `from_utf8` checks several times faster
+        // than `from_utf8_lossy` does while looking for invalid sequences to replace.
+        match str::from_utf8(path) {
+            Ok(name) => f(name, &record)?,
+            Err(_) => f(&String::from_utf8_lossy(path), &record)?,
+        }
     }
     Ok(())
 }
