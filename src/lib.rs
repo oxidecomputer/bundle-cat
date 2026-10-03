@@ -17,19 +17,29 @@ use serde::Deserialize;
 use serde_json::Value;
 use zstd::zstd_safe::{DCtx, ResetDirective};
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, BufReader, Read, Write};
 use std::num::NonZeroUsize;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::str;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, ScopedJoinHandle};
 
 /// Ignore lines with timestamps from the previous millenium.
 const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
 
 /// How much of a log file to search for a timestamp.
 const TIME_CHECK_MAX: u64 = 1 << 16;
+
+/// How much of a log file to read first when searching it for a timestamp. Most logs have one on
+/// their first line, so reading more is usually wasted.
+const TIME_CHECK_STEP: u64 = 1 << 12;
+
+/// How much output an `exec` command running ahead may produce before it must wait for its
+/// output to be written. Commands for files with little output finish well ahead, while ones with
+/// a lot are held to this much memory each.
+const EXEC_BUFFER_SIZE: usize = 1 << 20;
 
 /// The suffix of files compressed with zstd before being added to the bundle.
 const ZSTD_SUFFIX: &str = ".zst";
@@ -126,16 +136,12 @@ impl<'a> LogFile<'a> {
 
         // For logs rack/{rack_uuid}/sled/{sled_uuid}/logs/{zone}/{service}/...
         // Or for health checks rack/{rack_uuid}/sled/{sled_uuid}/{check}.json
-        let parts: Vec<_> = path.split('/').collect();
-
-        if parts.len() < 5 {
-            return None;
-        }
-
-        let sled_uuid = parts.get(3)?;
-
-        let zone = parts.get(5).copied();
-        let service = parts.get(6).copied();
+        let mut parts = path.split('/');
+        let sled_uuid = parts.nth(3)?;
+        // Only files within a sled's directory.
+        parts.next()?;
+        let zone = parts.next();
+        let service = parts.next();
 
         // Only archived logs have a trailing timestamp.
         let timestamp = Self::extract_timestamp(strip_zstd_suffix(path));
@@ -207,6 +213,9 @@ struct EntryLoc {
     method: CompressionMethod,
     /// The entry holds a zstd stream, independent of the zip's own compression `method`.
     zstd: bool,
+    /// The CRC and size of the entry once decompressed by the zip, from the central directory.
+    crc: u32,
+    size: u64,
 }
 
 impl EntryLoc {
@@ -219,7 +228,58 @@ impl EntryLoc {
             // truncated. Read it as the empty file it is instead.
             zstd: path.as_ref().ends_with(ZSTD_SUFFIX.as_bytes())
                 && record.uncompressed_size_hint() > 0,
+            crc: record.crc32(),
+            size: record.uncompressed_size_hint(),
         }
+    }
+}
+
+/// Checks the size and CRC of an entry once it has been read to the end, as rawzip's
+/// `ZipVerifier` does, but with `crc32fast`, which uses the CPU's CRC instructions where it can.
+/// rawzip's table-based CRC takes longer than inflating a deflated entry.
+struct Verifier<R> {
+    inner: R,
+    hasher: crc32fast::Hasher,
+    read: u64,
+    crc: u32,
+    size: u64,
+}
+
+impl<R> Verifier<R> {
+    fn new(inner: R, loc: EntryLoc) -> Self {
+        Verifier {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            read: 0,
+            crc: loc.crc,
+            size: loc.size,
+        }
+    }
+}
+
+impl<R: Read> Read for Verifier<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.read += n as u64;
+
+        if n == 0 || self.read >= self.size {
+            let crc = self.hasher.clone().finalize();
+            if self.read != self.size || crc != self.crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "expected {} bytes with CRC {:#010x}, read {} with CRC {crc:#010x}",
+                        self.size, self.crc, self.read
+                    ),
+                ));
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -234,11 +294,143 @@ struct LogEntry {
     mtime: Option<Timestamp>,
 }
 
+/// An `--exec` command started on a log file, whose output is waiting to be written.
+struct ExecJob<'scope, 'env> {
+    log: &'env LogEntry,
+    child: Child,
+    pending: Arc<PendingOutput>,
+    /// The thread writing the file to the command's input.
+    feeder: Option<ScopedJoinHandle<'scope, Result<()>>>,
+}
+
+impl ExecJob<'_, '_> {
+    /// Write the command's output, as it arrives, and check that it succeeded.
+    fn finish(mut self, exec: &str, no_header: bool, out: &mut impl Write) -> Result<()> {
+        if !no_header {
+            writeln!(out, "==> {} <==", self.log.path)?;
+        }
+
+        let copied = (|| -> io::Result<()> {
+            while let Some(chunk) = self.pending.take() {
+                out.write_all(&chunk?)?;
+            }
+            Ok(())
+        })();
+        // Return before waiting on the feeder if output failed, as the command may be blocked on
+        // output that will no longer be read, and the feeder in turn on the command. Dropping the
+        // job stops the command.
+        copied.with_context(|| format!("failed to copy file {}", self.log.path))?;
+        if let Some(feeder) = self.feeder.take() {
+            feeder.join().unwrap()?;
+        }
+
+        let status = self.child.wait()?;
+        if !status.success() {
+            anyhow::bail!("command '{exec}' exited with {status}");
+        }
+
+        if !no_header {
+            writeln!(out)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ExecJob<'_, '_> {
+    /// Stop a command whose output will not be written, after an error, so that the threads
+    /// feeding and reading it can finish.
+    fn drop(&mut self) {
+        self.pending.cancel();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Output read from an `--exec` command that has yet to be written, passed from the thread
+/// reading it to the one writing it.
+struct PendingOutput {
+    state: Mutex<PendingState>,
+    changed: Condvar,
+    /// Stop reading the command's output while this many bytes are waiting.
+    limit: usize,
+}
+
+#[derive(Default)]
+struct PendingState {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// How reading ended, once the command's output has closed.
+    done: Option<io::Result<()>>,
+    cancelled: bool,
+}
+
+impl PendingOutput {
+    fn new(limit: usize) -> Self {
+        PendingOutput {
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            limit,
+        }
+    }
+
+    /// Read `reader` to the end, holding its output until it is taken. While `limit` bytes are
+    /// waiting, stop reading, so that a command with more to write blocks on its full pipe.
+    fn fill_from(&self, mut reader: impl Read) {
+        let mut buf = vec![0; 64 << 10];
+        let result = loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break Ok(()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => break Err(e),
+            };
+
+            let mut state = self.state.lock().unwrap();
+            while state.bytes > 0 && state.bytes >= self.limit && !state.cancelled {
+                state = self.changed.wait(state).unwrap();
+            }
+            if state.cancelled {
+                return;
+            }
+            state.bytes += n;
+            state.chunks.push_back(buf[..n].to_vec());
+            self.changed.notify_all();
+        };
+
+        self.state.lock().unwrap().done = Some(result);
+        self.changed.notify_all();
+    }
+
+    /// Take the next chunk of output, waiting for one. Returns `None` once all of it is taken.
+    fn take(&self) -> Option<io::Result<Vec<u8>>> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(chunk) = state.chunks.pop_front() {
+                state.bytes -= chunk.len();
+                self.changed.notify_all();
+                return Some(Ok(chunk));
+            }
+            if let Some(done) = state.done.take() {
+                return done.err().map(Err);
+            }
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn cancel(&self) {
+        self.state.lock().unwrap().cancelled = true;
+        self.changed.notify_all();
+    }
+}
+
 /// An Oxide support bundle.
 pub struct Bundle<R> {
     info: BundleInfo,
     archive: ZipArchive<R>,
     threads: NonZeroUsize,
+    exec_jobs: NonZeroUsize,
+    /// How much output each `--exec` command may produce ahead of it being written.
+    exec_buffer: usize,
 }
 
 impl<R: ReaderAt + Sync> Bundle<R> {
@@ -249,12 +441,21 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             info,
             archive,
             threads: NonZeroUsize::MIN,
+            exec_jobs: NonZeroUsize::MIN,
+            exec_buffer: EXEC_BUFFER_SIZE,
         })
     }
 
     /// Set the number of threads used to search log files for timestamps. Defaults to one.
     pub fn with_threads(mut self, threads: NonZeroUsize) -> Self {
         self.threads = threads;
+        self
+    }
+
+    /// Set the number of `exec` commands run at once, so that later files' commands run while
+    /// earlier files' output is written. Defaults to one.
+    pub fn with_exec_jobs(mut self, jobs: NonZeroUsize) -> Self {
+        self.exec_jobs = jobs;
         self
     }
 
@@ -295,6 +496,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             )?;
         }
 
+        out.flush()?;
         Ok(())
     }
 
@@ -332,6 +534,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             }
         }
 
+        out.flush()?;
         Ok(())
     }
 
@@ -380,66 +583,115 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             None
         };
 
-        let mut dctx = DCtx::create();
-        for (i, log) in logs.iter().enumerate() {
-            if in_range.as_ref().is_some_and(|in_range| !in_range[i]) {
-                continue;
-            }
+        let selected = logs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| in_range.as_ref().is_none_or(|in_range| in_range[*i]))
+            .map(|(_, log)| log);
 
-            if output.list {
-                writeln!(out, "{}", log.path)?;
-                continue;
-            }
-
-            if !output.no_header {
-                writeln!(out, "==> {} <==", log.path)?;
-            }
-
-            let mut file = open_entry(&self.archive, log.loc, &mut dctx)
-                .with_context(|| format!("failed to open file {}", log.path))?;
-
-            if let Some(exec) = output.exec {
-                let shell = std::env::var("SHELL").unwrap_or("/bin/sh".to_string());
-                let mut child = Command::new(&shell)
-                    .arg("-c")
-                    .arg(exec)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .spawn()?;
-
-                let mut child_in = child.stdin.take().unwrap();
-                let mut child_out = child.stdout.take().unwrap();
-
-                let copy_result = thread::scope(|s| {
-                    let out_writer = s.spawn(|| io::copy(&mut child_out, &mut out));
-
-                    let in_result = write_file_content(
-                        &mut file,
-                        &mut child_in,
-                        output.line_ct.map(|l| l.get()),
-                    );
-                    drop(child_in); // EOF.
-
-                    let out_result = out_writer.join().unwrap();
-                    in_result.and(out_result)
-                });
-                copy_result.with_context(|| format!("failed to copy file {}", log.path))?;
-
-                let status = child.wait()?;
-                if !status.success() {
-                    anyhow::bail!("command '{exec}' exited with {status}");
+        if let Some(exec) = output.exec
+            && !output.list
+        {
+            self.exec_logs(selected, exec, output, &mut out)?;
+        } else {
+            let mut dctx = DCtx::create();
+            for log in selected {
+                if output.list {
+                    writeln!(out, "{}", log.path)?;
+                    continue;
                 }
-            } else {
+
+                if !output.no_header {
+                    writeln!(out, "==> {} <==", log.path)?;
+                }
+
+                let mut file = open_entry(&self.archive, log.loc, &mut dctx)
+                    .with_context(|| format!("failed to open file {}", log.path))?;
                 write_file_content(&mut file, &mut out, output.line_ct.map(|l| l.get()))
                     .with_context(|| format!("failed to copy file {}", log.path))?;
-            }
 
-            if !output.no_header {
-                writeln!(out)?;
+                if !output.no_header {
+                    writeln!(out)?;
+                }
             }
         }
 
+        out.flush()?;
         Ok(())
+    }
+
+    /// Pipe each of `logs` through `exec` and write each command's output in turn. Up to
+    /// `self.exec_jobs` commands run at once, so that the output for the next files is ready, or
+    /// partly so, by the time it is written.
+    fn exec_logs<'l, W: Write + Send>(
+        &self,
+        mut logs: impl Iterator<Item = &'l LogEntry>,
+        exec: &str,
+        output: LogOutput<'_>,
+        mut out: W,
+    ) -> Result<()> {
+        let shell = std::env::var("SHELL").unwrap_or("/bin/sh".to_string());
+        let jobs = self.exec_jobs.get();
+
+        thread::scope(|s| {
+            let mut running = VecDeque::with_capacity(jobs);
+            loop {
+                while running.len() < jobs
+                    && let Some(log) = logs.next()
+                {
+                    running.push_back(self.start_exec(s, log, &shell, exec, output)?);
+                }
+
+                let Some(job) = running.pop_front() else {
+                    return Ok(());
+                };
+                job.finish(exec, output.no_header, &mut out)?;
+            }
+        })
+    }
+
+    /// Start `exec` on `log`, with threads to feed it the file and collect its output.
+    fn start_exec<'scope, 'env>(
+        &'env self,
+        s: &'scope thread::Scope<'scope, 'env>,
+        log: &'env LogEntry,
+        shell: &str,
+        exec: &str,
+        output: LogOutput<'_>,
+    ) -> Result<ExecJob<'scope, 'env>> {
+        let mut child = Command::new(shell)
+            .arg("-c")
+            .arg(exec)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let mut child_in = child.stdin.take().unwrap();
+        let child_out = child.stdout.take().unwrap();
+
+        let line_ct = output.line_ct.map(|l| l.get());
+        let feeder = s.spawn(move || -> Result<()> {
+            let mut dctx = DCtx::create();
+            let mut file = open_entry(&self.archive, log.loc, &mut dctx)
+                .with_context(|| format!("failed to open file {}", log.path))?;
+            match write_file_content(&mut file, &mut child_in, line_ct) {
+                // The command closed its input without reading all of the file, as `head` does.
+                // As in a shell pipeline, its exit status says whether that was a failure.
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                result => result.with_context(|| format!("failed to copy file {}", log.path)),
+            }
+            // Dropping `child_in` closes the command's input.
+        });
+
+        let pending = Arc::new(PendingOutput::new(self.exec_buffer));
+        let collector = Arc::clone(&pending);
+        s.spawn(move || collector.fill_from(child_out));
+
+        Ok(ExecJob {
+            log,
+            child,
+            pending,
+            feeder: Some(feeder),
+        })
     }
 
     /// Determine which of `logs` fall within `time`, reading up to `self.threads` files at once.
@@ -492,9 +744,8 @@ impl<R: ReaderAt + Sync> Bundle<R> {
         buf: &mut Vec<u8>,
         dctx: &mut DCtx<'static>,
     ) -> Result<Option<Timestamp>> {
-        buf.clear();
-        open_entry_unverified(&self.archive, log.loc, dctx)
-            .and_then(|file| Ok(file.take(TIME_CHECK_MAX).read_to_end(buf)?))
+        let contents_ts = open_entry_unverified(&self.archive, log.loc, dctx)
+            .and_then(|file| Ok(find_timestamp(file, buf)?))
             .with_context(|| format!("failed to read file {}", log.path))?;
 
         // Try several methods of finding the log's timeframe, in order of decreasing accuracy:
@@ -504,7 +755,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
         // 3. Check the file's mtime in the zip, which will be available with R17.
         // In all cases ignore times from before 2001, and skip any file where we cannot find a
         // valid time.
-        Ok(read_timestamp_from_contents(buf)
+        Ok(contents_ts
             .or_else(|| Timestamp::from_second(log.name_timestamp?).ok())
             .or(log.mtime))
     }
@@ -541,6 +792,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             writeln!(out, "{service}")?;
         }
 
+        out.flush()?;
         Ok(())
     }
 
@@ -603,6 +855,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             }
         }
 
+        out.flush()?;
         Ok(())
     }
 
@@ -620,6 +873,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             writeln!(out, "{zone}")?;
         }
 
+        out.flush()?;
         Ok(())
     }
 }
@@ -649,19 +903,28 @@ impl BundleInfo {
             }
 
             // rack/{rack_uuid}/sled/{sled_uuid}/logs/{zone}/{service}/...
-            let splits: Vec<_> = name.split('/').collect();
+            // Only the first seven parts are needed, so keep them on the stack rather than
+            // allocating for every entry.
+            let mut splits = [""; 7];
+            let mut len = 0;
+            for (i, part) in name.split('/').enumerate() {
+                if let Some(split) = splits.get_mut(i) {
+                    *split = part;
+                }
+                len = i + 1;
+            }
 
             // The zone directory itself will have a length of 7, but we want zone directories that have at least one child.
             // Empty directories may exist for zones that don't actually exist on the sled, e.g., `oxz_switch`.
-            if splits.len() == 8 {
+            if len == 8 {
                 insert_nested(&mut sled_zones, splits[3], splits[5]);
             }
 
-            if splits.len() == 9 {
+            if len == 9 {
                 insert_nested(&mut sled_services, splits[3], splits[6]);
             }
 
-            if name.ends_with("sled.txt") && splits.len() == 5 {
+            if name.ends_with("sled.txt") && len == 5 {
                 sled_txts.push((EntryLoc::new(record), name.to_string()));
             }
             Ok(())
@@ -746,8 +1009,13 @@ fn for_each_entry<R: ReaderAt>(
         .context("failed to read zip central directory")?
     {
         let path = record.file_path();
-        let name = String::from_utf8_lossy(path.as_ref());
-        f(&name, &record)?;
+        let path: &[u8] = path.as_ref();
+        // Names are nearly always valid UTF-8, which `from_utf8` checks several times faster
+        // than `from_utf8_lossy` does while looking for invalid sequences to replace.
+        match str::from_utf8(path) {
+            Ok(name) => f(name, &record)?,
+            Err(_) => f(&String::from_utf8_lossy(path), &record)?,
+        }
     }
     Ok(())
 }
@@ -763,7 +1031,7 @@ fn open_entry<'a, R: ReaderAt>(
     let reader = decompress(entry.reader(), loc.method)?;
     // The CRC covers the entry as stored, i.e. the compressed bytes of a zstd file, so verify
     // before decoding it. The decoder reads until EOF, letting the verifier see the end.
-    decompress_zstd(entry.verifying_reader(reader), loc.zstd, dctx)
+    decompress_zstd(Verifier::new(reader, loc), loc.zstd, dctx)
 }
 
 /// Open a reader over the decompressed contents of an entry without verifying its CRC, for callers
@@ -1005,6 +1273,40 @@ fn write_n_lines<R: Read, W: Write>(
         }
 
         writer.write_all(chunk)?;
+    }
+}
+
+/// Search the first `TIME_CHECK_MAX` bytes of `file` for a timestamp, using `buf` to hold them.
+///
+/// Read in steps that double in size, searching the complete lines from each step before reading
+/// more, so a timestamp near the start is found without reading the rest. Lines are searched in
+/// order and the final, partial line only once nothing more will be read, so this finds the same
+/// timestamp as reading everything up front.
+fn find_timestamp(mut file: impl Read, buf: &mut Vec<u8>) -> io::Result<Option<Timestamp>> {
+    buf.clear();
+    let mut searched = 0;
+    let mut step = TIME_CHECK_STEP;
+    loop {
+        let limit = step.min(TIME_CHECK_MAX - buf.len() as u64);
+        let read = (&mut file).take(limit).read_to_end(buf)?;
+        let done = (read as u64) < limit || buf.len() as u64 >= TIME_CHECK_MAX;
+
+        let end = if done {
+            buf.len()
+        } else {
+            buf[searched..]
+                .rfind_byte(b'\n')
+                .map_or(searched, |i| searched + i + 1)
+        };
+        if let Some(ts) = read_timestamp_from_contents(&buf[searched..end]) {
+            return Ok(Some(ts));
+        }
+        if done {
+            return Ok(None);
+        }
+
+        searched = end;
+        step *= 2;
     }
 }
 
@@ -1294,6 +1596,34 @@ mod tests {
 
     fn build_zip(buf: &mut Vec<u8>) -> ZipArchive<Cursor<&[u8]>> {
         build_zip_from(buf, zip_files(), false)
+    }
+
+    /// The test files with a log of about 1.2 MiB, several zstd blocks, ahead of the other logs.
+    fn zip_files_with_big_log() -> Vec<ZipFile> {
+        let big_log = (0..20_000)
+            .map(|i| {
+                format!(
+                    r#"{{"msg":"line {i}","time":"2025-09-24T07:00:00Z","n":{}}}"#,
+                    i * 7919
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut files = zip_files();
+        let first_log = files
+            .iter()
+            .position(|f| f.name.contains("/logs/") && f.contents.is_some())
+            .unwrap();
+        files.insert(
+            first_log,
+            ZipFile {
+                name: "rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758700000",
+                contents: Some(big_log),
+                ..Default::default()
+            },
+        );
+        files
     }
 
     /// Build a zip of `files`. With `zstd_logs`, each file under a "logs/" directory is
@@ -1729,39 +2059,21 @@ mod tests {
     /// affect the next log decoded with the same context.
     #[test]
     fn test_logs_zstd_partial_read() {
-        let big_log = (0..20_000)
-            .map(|i| {
-                format!(
-                    r#"{{"msg":"line {i}","time":"2025-09-24T07:00:00Z","n":{}}}"#,
-                    i * 7919
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Place the big log ahead of the others, so that they are read after it.
-        let files = || {
-            let mut files = zip_files();
-            let first_log = files
-                .iter()
-                .position(|f| f.name.contains("/logs/") && f.contents.is_some())
-                .unwrap();
-            files.insert(
-                first_log,
-                ZipFile {
-                    name: "rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758700000",
-                    contents: Some(big_log.clone()),
-                    ..Default::default()
-                },
-            );
-            files
-        };
-
         let mut plain_buf = Vec::new();
-        let plain = Bundle::from_archive(build_zip_from(&mut plain_buf, files(), false)).unwrap();
+        let plain = Bundle::from_archive(build_zip_from(
+            &mut plain_buf,
+            zip_files_with_big_log(),
+            false,
+        ))
+        .unwrap();
 
         let mut zstd_buf = Vec::new();
-        let zstd = Bundle::from_archive(build_zip_from(&mut zstd_buf, files(), true)).unwrap();
+        let zstd = Bundle::from_archive(build_zip_from(
+            &mut zstd_buf,
+            zip_files_with_big_log(),
+            true,
+        ))
+        .unwrap();
 
         let cases = [
             (
@@ -1798,6 +2110,207 @@ mod tests {
                 "{time:?} {output:?}"
             );
         }
+    }
+
+    /// Running `exec` commands ahead of output prints the same as running them one at a time,
+    /// including when commands fill their buffers and wait for their output to be written.
+    #[test]
+    fn test_logs_exec_jobs() {
+        let jobs = NonZeroUsize::new(4).unwrap();
+        for zstd_logs in [false, true] {
+            let mut buf = Vec::new();
+            build_zip_from(&mut buf, zip_files_with_big_log(), zstd_logs);
+            let bundle = || {
+                let archive = ZipArchive::from_slice(&buf[..])
+                    .unwrap()
+                    .into_cursor_archive();
+                Bundle::from_archive(archive).unwrap()
+            };
+
+            for exec in ["cat", "wc -l", "tail -n 2"] {
+                let run = |bundle: Bundle<_>| {
+                    let mut out = Vec::new();
+                    let output = LogOutput {
+                        exec: Some(exec),
+                        ..Default::default()
+                    };
+                    bundle
+                        .logs(LogFilter::default(), TimeRange::default(), output, &mut out)
+                        .unwrap();
+                    String::from_utf8(out).unwrap()
+                };
+
+                let one_at_a_time = run(bundle());
+                let ahead = run(bundle().with_exec_jobs(jobs));
+                // Hold back each command after its first read of output.
+                let mut held = bundle().with_exec_jobs(jobs);
+                held.exec_buffer = 0;
+                let held = run(held);
+
+                assert!(one_at_a_time.lines().count() > 10, "{exec}");
+                assert_eq!(ahead, one_at_a_time, "{exec}, zstd: {zstd_logs}");
+                assert_eq!(held, one_at_a_time, "{exec}, zstd: {zstd_logs}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_logs_exec_failure() {
+        let mut buf = Vec::new();
+        let bundle = Bundle::from_archive(build_zip_from(&mut buf, zip_files_with_big_log(), true))
+            .unwrap()
+            .with_exec_jobs(NonZeroUsize::new(4).unwrap());
+
+        let exec = "cat > /dev/null; false";
+        let err = bundle
+            .logs(
+                LogFilter::default(),
+                TimeRange::default(),
+                LogOutput {
+                    exec: Some(exec),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("command '{exec}' exited with")),
+            "{err:#}"
+        );
+    }
+
+    /// A command that exits without reading all of its input, like `head`, is not an error, and
+    /// the files after it are still run through the command.
+    #[test]
+    fn test_logs_exec_partial_input() {
+        for zstd_logs in [false, true] {
+            let mut buf = Vec::new();
+            build_zip_from(&mut buf, zip_files_with_big_log(), zstd_logs);
+            let bundle = || {
+                let archive = ZipArchive::from_slice(&buf[..])
+                    .unwrap()
+                    .into_cursor_archive();
+                Bundle::from_archive(archive).unwrap()
+            };
+            let run = |bundle: Bundle<_>, output| {
+                let mut out = Vec::new();
+                bundle
+                    .logs(LogFilter::default(), TimeRange::default(), output, &mut out)
+                    .unwrap();
+                String::from_utf8(out).unwrap()
+            };
+
+            let first_lines = run(
+                bundle(),
+                LogOutput {
+                    line_ct: Some(NonZeroUsize::MIN),
+                    ..Default::default()
+                },
+            );
+            assert!(first_lines.lines().count() > 10);
+
+            for jobs in [1, 6] {
+                let head = run(
+                    bundle().with_exec_jobs(NonZeroUsize::new(jobs).unwrap()),
+                    LogOutput {
+                        exec: Some("head -n 1"),
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(head, first_lines, "jobs: {jobs}, zstd: {zstd_logs}");
+            }
+        }
+    }
+
+    /// A writer that fails once `limit` bytes are written, as standard output does once the
+    /// command reading it exits.
+    struct ClosingWriter {
+        written: usize,
+        limit: usize,
+    }
+
+    impl Write for ClosingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written >= self.limit {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            let n = buf.len().min(self.limit - self.written);
+            self.written += n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Writing output fails partway through a large file, while commands are blocked writing
+    /// their output. They are stopped, rather than left for `logs` to wait on forever.
+    #[test]
+    fn test_logs_exec_output_closed() {
+        for jobs in [1, 4] {
+            let mut buf = Vec::new();
+            let mut bundle =
+                Bundle::from_archive(build_zip_from(&mut buf, zip_files_with_big_log(), true))
+                    .unwrap()
+                    .with_exec_jobs(NonZeroUsize::new(jobs).unwrap());
+            // Hold back each command after its first read of output, so that `cat` blocks well
+            // before reading all of the big log.
+            bundle.exec_buffer = 0;
+
+            let err = bundle
+                .logs(
+                    LogFilter::default(),
+                    TimeRange::default(),
+                    LogOutput {
+                        exec: Some("cat"),
+                        ..Default::default()
+                    },
+                    ClosingWriter {
+                        written: 0,
+                        limit: 1000,
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<io::Error>().map(io::Error::kind),
+                Some(io::ErrorKind::BrokenPipe),
+                "jobs: {jobs}, {err:#}"
+            );
+        }
+    }
+
+    /// Reading all of an entry whose contents do not match its CRC fails.
+    #[test]
+    fn test_logs_crc_mismatch() {
+        let mut buf = Vec::new();
+        build_zip(&mut buf);
+        let at = buf
+            .find("inventory_collection")
+            .expect("the nexus log is stored uncompressed");
+        buf[at] = b'I';
+
+        let archive = ZipArchive::from_slice(&buf[..])
+            .unwrap()
+            .into_cursor_archive();
+        let err = Bundle::from_archive(archive)
+            .unwrap()
+            .logs(
+                LogFilter {
+                    path: &[Pattern::new("*oxide-nexus*").unwrap()],
+                    ..Default::default()
+                },
+                TimeRange::default(),
+                LogOutput::default(),
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -2002,6 +2515,49 @@ mod tests {
         let mut out = Vec::new();
         bundle.sleds(&mut out).unwrap();
         assert_snapshot!("sleds_incomplete_bundle", String::from_utf8_lossy(&out));
+    }
+
+    /// Reading in steps finds the same timestamp as searching the whole start of the file.
+    #[test]
+    fn test_find_timestamp() {
+        let bogus = r#"{"msg":"m","time":"1986-12-26T07:30:02Z"}"#;
+        let good = r#"{"msg":"m","time":"2025-09-24T07:30:02Z"}"#;
+        let line_len = bogus.len() + 1;
+
+        let mut cases = vec![
+            String::new(),
+            good.to_string(),
+            format!("{good}\n"),
+            format!("{good}\r\n{bogus}"),
+            "not json\n".repeat(20_000),
+        ];
+        // Put a good line after bogus ones, so it starts, ends or straddles each step boundary,
+        // and at and past the end of what is searched.
+        for n in (0..=TIME_CHECK_MAX as usize / line_len + 1).step_by(7) {
+            cases.push(format!(
+                "{}{good}\n{bogus}\n",
+                format!("{bogus}\n").repeat(n)
+            ));
+        }
+        for boundary in [TIME_CHECK_STEP, 3 * TIME_CHECK_STEP, 7 * TIME_CHECK_STEP] {
+            let pad = "x".repeat(boundary as usize - 10);
+            cases.push(format!("{pad}\n{good}\n"));
+            cases.push(format!("{pad}{good}\n"));
+        }
+        let pad = "x".repeat(TIME_CHECK_MAX as usize - good.len());
+        cases.push(format!("{pad}{good}"));
+        cases.push(format!("{pad}\n{good}"));
+
+        let mut buf = Vec::new();
+        for contents in &cases {
+            let start = &contents.as_bytes()[..contents.len().min(TIME_CHECK_MAX as usize)];
+            assert_eq!(
+                find_timestamp(contents.as_bytes(), &mut buf).unwrap(),
+                read_timestamp_from_contents(start),
+                "{} bytes",
+                contents.len()
+            );
+        }
     }
 
     #[test]

@@ -10,18 +10,27 @@ use glob::Pattern;
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
-use rawzip::ZipArchive;
+use rawzip::{ReaderAt, ZipArchive};
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process;
 
 use bundle_cat::{Bundle, ComponentInfo, LogFilter, LogOutput, TimeRange};
 
-/// Upper bound on the number of threads used to search logs for timestamps.
+/// Upper bound on the number of threads used to search logs for timestamps. The search stops
+/// scaling well past six threads.
 const MAX_THREADS: NonZeroUsize = NonZeroUsize::new(6).unwrap();
+
+/// Upper bound on the number of `--exec` commands run at once, as many as the threads searching
+/// for timestamps. Each command running ahead of the output may hold up to 1 MiB of its output,
+/// plus a zstd decoder of a few MiB for its file.
+const MAX_EXEC_JOBS: NonZeroUsize = NonZeroUsize::new(6).unwrap();
+
+/// How much output to collect before writing it to standard output.
+const OUTPUT_BUFFER_SIZE: usize = 256 << 10;
 
 #[derive(Parser, Debug)]
 #[command(about = "Filter and extract logs from support bundles")]
@@ -190,17 +199,35 @@ fn run() -> Result<()> {
             args.zip_path.display()
         )
     })?;
+
+    // Reading through a memory map avoids a system call for each read of each file, which is
+    // much of the cost of reading the start of many files. Fall back to reading the file where
+    // it can't be mapped.
+    //
+    // SAFETY: The map is only sound while nothing else truncates or modifies the file. Bundles
+    // are not written to once downloaded.
+    if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
+        let archive = ZipArchive::from_slice(&map[..])
+            .context("failed to read zip archive")?
+            .into_cursor_archive();
+        return run_command(&args, archive);
+    }
+
     let mut buf = vec![0u8; rawzip::RECOMMENDED_BUFFER_SIZE];
     let archive = ZipArchive::from_file(file, &mut buf).context("failed to read zip archive")?;
     drop(buf);
+    run_command(&args, archive)
+}
 
-    // Searching logs for timestamps stops scaling well past six threads.
-    let threads = std::thread::available_parallelism()
-        .unwrap_or(NonZeroUsize::MIN)
-        .min(MAX_THREADS);
+fn run_command<R: ReaderAt + Sync>(args: &Cli, archive: ZipArchive<R>) -> Result<()> {
+    let parallelism = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
     let bundle = Bundle::from_archive(archive)
         .context("failed to parse sled information from bundle")?
-        .with_threads(threads);
+        .with_threads(parallelism.min(MAX_THREADS))
+        .with_exec_jobs(parallelism.min(MAX_EXEC_JOBS));
+
+    // Standard output is line buffered, which would make a system call for nearly every write.
+    let out = BufWriter::with_capacity(OUTPUT_BUFFER_SIZE, io::stdout());
 
     match &args.command {
         Commands::Ereports(EreportCmds::List(l)) => bundle.ereports_list(
@@ -209,7 +236,7 @@ fn run() -> Result<()> {
                 serial: &l.serial,
                 class: &l.class,
             },
-            io::stdout(),
+            out,
         ),
         Commands::Ereports(EreportCmds::Show(s)) => bundle.ereports_show(
             ComponentInfo {
@@ -218,7 +245,7 @@ fn run() -> Result<()> {
                 class: &s.class,
             },
             s.no_header,
-            io::stdout(),
+            out,
         ),
 
         Commands::Logs(l) => bundle.logs(
@@ -238,10 +265,10 @@ fn run() -> Result<()> {
                 no_header: l.no_header,
                 exec: l.exec.as_deref(),
             },
-            io::stdout(),
+            out,
         ),
-        Commands::Services(s) => bundle.services(&s.sled, io::stdout()),
-        Commands::Sleds => bundle.sleds(io::stdout()),
-        Commands::Zones(z) => bundle.zones(&z.sled, io::stdout()),
+        Commands::Services(s) => bundle.services(&s.sled, out),
+        Commands::Sleds => bundle.sleds(out),
+        Commands::Zones(z) => bundle.zones(&z.sled, out),
     }
 }
