@@ -10,7 +10,7 @@ use glob::Pattern;
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
-use rawzip::ZipArchive;
+use rawzip::{ReaderAt, ZipArchive};
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -193,10 +193,27 @@ fn run() -> Result<()> {
             args.zip_path.display()
         )
     })?;
+
+    // Reading through a memory map avoids a system call for each read of each file, which is
+    // much of the cost of reading the start of many files. Fall back to reading the file where
+    // it can't be mapped.
+    //
+    // SAFETY: The map is only sound while nothing else truncates or modifies the file. Bundles
+    // are not written to once downloaded.
+    if let Ok(map) = unsafe { memmap2::Mmap::map(&file) } {
+        let archive = ZipArchive::from_slice(&map[..])
+            .context("failed to read zip archive")?
+            .into_cursor_archive();
+        return run_command(&args, archive);
+    }
+
     let mut buf = vec![0u8; rawzip::RECOMMENDED_BUFFER_SIZE];
     let archive = ZipArchive::from_file(file, &mut buf).context("failed to read zip archive")?;
     drop(buf);
+    run_command(&args, archive)
+}
 
+fn run_command<R: ReaderAt + Sync>(args: &Cli, archive: ZipArchive<R>) -> Result<()> {
     // Searching logs for timestamps stops scaling well past six threads.
     let threads = std::thread::available_parallelism()
         .unwrap_or(NonZeroUsize::MIN)
