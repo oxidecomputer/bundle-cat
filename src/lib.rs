@@ -213,6 +213,9 @@ struct EntryLoc {
     method: CompressionMethod,
     /// The entry holds a zstd stream, independent of the zip's own compression `method`.
     zstd: bool,
+    /// The CRC and size of the entry once decompressed by the zip, from the central directory.
+    crc: u32,
+    size: u64,
 }
 
 impl EntryLoc {
@@ -225,7 +228,58 @@ impl EntryLoc {
             // truncated. Read it as the empty file it is instead.
             zstd: path.as_ref().ends_with(ZSTD_SUFFIX.as_bytes())
                 && record.uncompressed_size_hint() > 0,
+            crc: record.crc32(),
+            size: record.uncompressed_size_hint(),
         }
+    }
+}
+
+/// Checks the size and CRC of an entry once it has been read to the end, as rawzip's
+/// `ZipVerifier` does, but with `crc32fast`, which uses the CPU's CRC instructions where it can.
+/// rawzip's table-based CRC takes longer than inflating a deflated entry.
+struct Verifier<R> {
+    inner: R,
+    hasher: crc32fast::Hasher,
+    read: u64,
+    crc: u32,
+    size: u64,
+}
+
+impl<R> Verifier<R> {
+    fn new(inner: R, loc: EntryLoc) -> Self {
+        Verifier {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            read: 0,
+            crc: loc.crc,
+            size: loc.size,
+        }
+    }
+}
+
+impl<R: Read> Read for Verifier<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.read += n as u64;
+
+        if n == 0 || self.read >= self.size {
+            let crc = self.hasher.clone().finalize();
+            if self.read != self.size || crc != self.crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "expected {} bytes with CRC {:#010x}, read {} with CRC {crc:#010x}",
+                        self.size, self.crc, self.read
+                    ),
+                ));
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -977,7 +1031,7 @@ fn open_entry<'a, R: ReaderAt>(
     let reader = decompress(entry.reader(), loc.method)?;
     // The CRC covers the entry as stored, i.e. the compressed bytes of a zstd file, so verify
     // before decoding it. The decoder reads until EOF, letting the verifier see the end.
-    decompress_zstd(entry.verifying_reader(reader), loc.zstd, dctx)
+    decompress_zstd(Verifier::new(reader, loc), loc.zstd, dctx)
 }
 
 /// Open a reader over the decompressed contents of an entry without verifying its CRC, for callers
@@ -2225,6 +2279,38 @@ mod tests {
                 "jobs: {jobs}, {err:#}"
             );
         }
+    }
+
+    /// Reading all of an entry whose contents do not match its CRC fails.
+    #[test]
+    fn test_logs_crc_mismatch() {
+        let mut buf = Vec::new();
+        build_zip(&mut buf);
+        let at = buf
+            .find("inventory_collection")
+            .expect("the nexus log is stored uncompressed");
+        buf[at] = b'I';
+
+        let archive = ZipArchive::from_slice(&buf[..])
+            .unwrap()
+            .into_cursor_archive();
+        let err = Bundle::from_archive(archive)
+            .unwrap()
+            .logs(
+                LogFilter {
+                    path: &[Pattern::new("*oxide-nexus*").unwrap()],
+                    ..Default::default()
+                },
+                TimeRange::default(),
+                LogOutput::default(),
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::InvalidData),
+            "{err:#}"
+        );
     }
 
     #[test]

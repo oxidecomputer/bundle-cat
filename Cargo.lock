@@ -109,6 +109,7 @@ dependencies = [
  "anyhow",
  "bstr",
  "clap",
+ "crc32fast",
  "flate2",
  "glob",
  "insta",
