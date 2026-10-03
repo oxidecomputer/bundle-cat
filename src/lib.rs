@@ -15,6 +15,7 @@ use rawzip::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use zstd::zstd_safe::{DCtx, ResetDirective};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, BufReader, Read, Write};
@@ -29,6 +30,9 @@ const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
 
 /// How much of a log file to search for a timestamp.
 const TIME_CHECK_MAX: u64 = 1 << 16;
+
+/// The suffix of files compressed with zstd before being added to the bundle.
+const ZSTD_SUFFIX: &str = ".zst";
 
 /// Glob-pattern filters selecting ereports by hardware component.
 #[derive(Clone, Copy, Default, Debug)]
@@ -134,7 +138,7 @@ impl<'a> LogFile<'a> {
         let service = parts.get(6).copied();
 
         // Only archived logs have a trailing timestamp.
-        let timestamp = Self::extract_timestamp(path);
+        let timestamp = Self::extract_timestamp(strip_zstd_suffix(path));
 
         Some(LogFile {
             path,
@@ -181,8 +185,19 @@ impl<'a> LogFile<'a> {
         if path_patterns.is_empty() {
             return true;
         }
-        path_patterns.iter().any(|p| p.matches(self.path))
+
+        // Match compressed files by their original name too, so that patterns like
+        // "*default.log" find both old and new bundles' logs.
+        let uncompressed = strip_zstd_suffix(self.path);
+        path_patterns
+            .iter()
+            .any(|p| p.matches(self.path) || p.matches(uncompressed))
     }
+}
+
+/// The name a file had before it was compressed with zstd.
+fn strip_zstd_suffix(path: &str) -> &str {
+    path.strip_suffix(ZSTD_SUFFIX).unwrap_or(path)
 }
 
 /// The location of an entry's data within the archive, and how it is compressed.
@@ -190,13 +205,20 @@ impl<'a> LogFile<'a> {
 struct EntryLoc {
     wayfinder: ZipArchiveEntryWayfinder,
     method: CompressionMethod,
+    /// The entry holds a zstd stream, independent of the zip's own compression `method`.
+    zstd: bool,
 }
 
 impl EntryLoc {
     fn new(record: &ZipFileHeaderRecord<'_>) -> Self {
+        let path = record.file_path();
         EntryLoc {
             wayfinder: record.wayfinder(),
             method: record.compression_method(),
+            // An empty entry holds no zstd frame for the decoder to read, so it would fail as
+            // truncated. Read it as the empty file it is instead.
+            zstd: path.as_ref().ends_with(ZSTD_SUFFIX.as_bytes())
+                && record.uncompressed_size_hint() > 0,
         }
     }
 }
@@ -252,8 +274,9 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             "{:<11}\t{:<11}\t{:<36}\t{:<max_ena_len$}\tCLASS",
             "PART", "SERIAL", "RESTART_ID", "ENA",
         )?;
+        let mut dctx = DCtx::create();
         for (loc, path, ereport) in ereports {
-            let contents = read_to_string(&self.archive, loc, &path)?;
+            let contents = read_to_string(&self.archive, loc, &path, &mut dctx)?;
             let ereport_class = read_ereport_class(&contents);
 
             if let Some(ereport_class) = ereport_class
@@ -282,8 +305,9 @@ impl<R: ReaderAt + Sync> Bundle<R> {
         no_header: bool,
         mut out: W,
     ) -> Result<()> {
+        let mut dctx = DCtx::create();
         for (loc, path, _) in self.matching_ereports(components)? {
-            let contents = read_to_string(&self.archive, loc, &path)?;
+            let contents = read_to_string(&self.archive, loc, &path, &mut dctx)?;
 
             if let Some(ereport_class) = read_ereport_class(&contents)
                 && !matches_patterns(components.class, ereport_class)
@@ -356,6 +380,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             None
         };
 
+        let mut dctx = DCtx::create();
         for (i, log) in logs.iter().enumerate() {
             if in_range.as_ref().is_some_and(|in_range| !in_range[i]) {
                 continue;
@@ -370,7 +395,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
                 writeln!(out, "==> {} <==", log.path)?;
             }
 
-            let mut file = open_entry(&self.archive, log.loc)
+            let mut file = open_entry(&self.archive, log.loc, &mut dctx)
                 .with_context(|| format!("failed to open file {}", log.path))?;
 
             if let Some(exec) = output.exec {
@@ -398,14 +423,15 @@ impl<R: ReaderAt + Sync> Bundle<R> {
                     let out_result = out_writer.join().unwrap();
                     in_result.and(out_result)
                 });
-                copy_result?;
+                copy_result.with_context(|| format!("failed to copy file {}", log.path))?;
 
                 let status = child.wait()?;
                 if !status.success() {
                     anyhow::bail!("command '{exec}' exited with {status}");
                 }
             } else {
-                write_file_content(&mut file, &mut out, output.line_ct.map(|l| l.get()))?;
+                write_file_content(&mut file, &mut out, output.line_ct.map(|l| l.get()))
+                    .with_context(|| format!("failed to copy file {}", log.path))?;
             }
 
             if !output.no_header {
@@ -428,13 +454,14 @@ impl<R: ReaderAt + Sync> Bundle<R> {
                 .map(|_| {
                     s.spawn(|| -> Result<()> {
                         let mut buf = Vec::with_capacity(TIME_CHECK_MAX as usize);
+                        let mut dctx = DCtx::create();
                         while !failed.load(Ordering::Relaxed) {
                             let i = next.fetch_add(1, Ordering::Relaxed);
                             let Some(log) = logs.get(i) else {
                                 break;
                             };
 
-                            match self.log_timestamp(log, &mut buf) {
+                            match self.log_timestamp(log, &mut buf, &mut dctx) {
                                 Ok(ts) => in_range[i].store(
                                     ts.is_some_and(|ts| time.contains(ts)),
                                     Ordering::Relaxed,
@@ -458,10 +485,15 @@ impl<R: ReaderAt + Sync> Bundle<R> {
         Ok(in_range.into_iter().map(AtomicBool::into_inner).collect())
     }
 
-    /// Find the log's timeframe, using `buf` to hold the start of the file.
-    fn log_timestamp(&self, log: &LogEntry, buf: &mut Vec<u8>) -> Result<Option<Timestamp>> {
+    /// Find the log's timeframe, using `buf` to hold the start of the file and `dctx` to decode it.
+    fn log_timestamp(
+        &self,
+        log: &LogEntry,
+        buf: &mut Vec<u8>,
+        dctx: &mut DCtx<'static>,
+    ) -> Result<Option<Timestamp>> {
         buf.clear();
-        open_entry_unverified(&self.archive, log.loc)
+        open_entry_unverified(&self.archive, log.loc, dctx)
             .and_then(|file| Ok(file.take(TIME_CHECK_MAX).read_to_end(buf)?))
             .with_context(|| format!("failed to read file {}", log.path))?;
 
@@ -635,8 +667,9 @@ impl BundleInfo {
             Ok(())
         })?;
 
+        let mut dctx = DCtx::create();
         for (loc, name) in sled_txts {
-            let contents = read_to_string(archive, loc, &name)?;
+            let contents = read_to_string(archive, loc, &name, &mut dctx)?;
             let (serial, is_scrimlet) = read_sled_serial(&contents)
                 .ok_or_else(|| anyhow::anyhow!("failed to parse sled serial from {name}"))?;
 
@@ -668,7 +701,7 @@ impl BundleInfo {
 
         let mut unhealthy_sleds = BTreeMap::new();
         if let Some(loc) = sled_info_json
-            && let Ok(mut sled_info) = open_entry(archive, loc)
+            && let Ok(mut sled_info) = open_entry(archive, loc, &mut dctx)
         {
             #[derive(Deserialize, Debug)]
             struct SledId {
@@ -719,22 +752,29 @@ fn for_each_entry<R: ReaderAt>(
     Ok(())
 }
 
-/// Open a reader over the decompressed contents of an entry. The CRC is verified if the entry is
-/// read to the end.
-fn open_entry<R: ReaderAt>(archive: &ZipArchive<R>, loc: EntryLoc) -> Result<Box<dyn Read + '_>> {
+/// Open a reader over the decompressed contents of an entry, decoding zstd files with `dctx`. The
+/// CRC is verified if the entry is read to the end.
+fn open_entry<'a, R: ReaderAt>(
+    archive: &'a ZipArchive<R>,
+    loc: EntryLoc,
+    dctx: &'a mut DCtx<'static>,
+) -> Result<Box<dyn Read + 'a>> {
     let entry = archive.get_entry(loc.wayfinder)?;
     let reader = decompress(entry.reader(), loc.method)?;
-    Ok(Box::new(entry.verifying_reader(reader)))
+    // The CRC covers the entry as stored, i.e. the compressed bytes of a zstd file, so verify
+    // before decoding it. The decoder reads until EOF, letting the verifier see the end.
+    decompress_zstd(entry.verifying_reader(reader), loc.zstd, dctx)
 }
 
 /// Open a reader over the decompressed contents of an entry without verifying its CRC, for callers
 /// that will only read the start of the file.
-fn open_entry_unverified<R: ReaderAt>(
-    archive: &ZipArchive<R>,
+fn open_entry_unverified<'a, R: ReaderAt>(
+    archive: &'a ZipArchive<R>,
     loc: EntryLoc,
-) -> Result<Box<dyn Read + '_>> {
+    dctx: &'a mut DCtx<'static>,
+) -> Result<Box<dyn Read + 'a>> {
     let entry = archive.get_entry(loc.wayfinder)?;
-    decompress(entry.reader(), loc.method)
+    decompress_zstd(decompress(entry.reader(), loc.method)?, loc.zstd, dctx)
 }
 
 fn decompress<'a>(raw: impl Read + 'a, method: CompressionMethod) -> Result<Box<dyn Read + 'a>> {
@@ -747,13 +787,41 @@ fn decompress<'a>(raw: impl Read + 'a, method: CompressionMethod) -> Result<Box<
     Ok(reader)
 }
 
+/// Decode a file that was compressed with zstd before being added to the zip, if `zstd` is set.
+///
+/// Callers pass in a `dctx` that they reuse from file to file. Creating a decoder per file would
+/// allocate its buffers, sized for the window of up to several MiB, each time, which adds
+/// noticeably to the cost of reading the start of many small logs.
+fn decompress_zstd<'a>(
+    reader: impl Read + 'a,
+    zstd: bool,
+    dctx: &'a mut DCtx<'static>,
+) -> Result<Box<dyn Read + 'a>> {
+    if !zstd {
+        return Ok(Box::new(reader));
+    }
+
+    // Discard any frame the last file using `dctx` stopped partway through.
+    dctx.reset(ResetDirective::SessionOnly).map_err(|code| {
+        anyhow::anyhow!(
+            "failed to reset zstd decoder: {}",
+            zstd::zstd_safe::get_error_name(code)
+        )
+    })?;
+    Ok(Box::new(zstd::Decoder::with_context(
+        BufReader::new(reader),
+        dctx,
+    )))
+}
+
 fn read_to_string<R: ReaderAt>(
     archive: &ZipArchive<R>,
     loc: EntryLoc,
     name: &str,
+    dctx: &mut DCtx<'static>,
 ) -> Result<String> {
     let mut buf = Vec::new();
-    open_entry(archive, loc)
+    open_entry(archive, loc, dctx)
         .and_then(|mut file| Ok(file.read_to_end(&mut buf)?))
         .with_context(|| format!("failed to read contents of {name}"))?;
     String::from_utf8(buf).with_context(|| format!("contents of {name} were not valid UTF-8"))
@@ -964,6 +1032,10 @@ mod tests {
 
     use std::io::Cursor;
     use std::str::FromStr;
+
+    /// Pretty-print JSON in color. `-b` keeps jq on Windows from writing CRLF line endings, and
+    /// changes nothing elsewhere.
+    const JQ_COLOR: &str = "jq -b -C .";
 
     #[derive(Default)]
     struct ZipFile {
@@ -1221,12 +1293,22 @@ mod tests {
     }
 
     fn build_zip(buf: &mut Vec<u8>) -> ZipArchive<Cursor<&[u8]>> {
+        build_zip_from(buf, zip_files(), false)
+    }
+
+    /// Build a zip of `files`. With `zstd_logs`, each file under a "logs/" directory is
+    /// compressed with zstd and given a ".zst" suffix, as in newer bundles.
+    fn build_zip_from(
+        buf: &mut Vec<u8>,
+        files: Vec<ZipFile>,
+        zstd_logs: bool,
+    ) -> ZipArchive<Cursor<&[u8]>> {
         let mut zip = ZipWriter::new(Cursor::new(&mut *buf));
 
         // Alternate between stored and deflated files, as found in real bundles, so that each kind
         // of file is read through both paths.
         let mut deflate = false;
-        for file in zip_files() {
+        for file in files {
             let options = SimpleFileOptions::default()
                 .compression_method(CompressionMethod::Stored)
                 .last_modified_time(file.mtime.unwrap_or_default());
@@ -1238,9 +1320,18 @@ mod tests {
                 };
                 deflate = !deflate;
 
-                zip.start_file(file.name, options).unwrap();
-                zip.write_all(contents.as_bytes()).unwrap();
-                zip.write_all(b"\n").unwrap();
+                let mut contents = contents.into_bytes();
+                contents.push(b'\n');
+
+                if zstd_logs && file.name.contains("/logs/") {
+                    let compressed = zstd::encode_all(&contents[..], 3).unwrap();
+                    zip.start_file(format!("{}{ZSTD_SUFFIX}", file.name), options)
+                        .unwrap();
+                    zip.write_all(&compressed).unwrap();
+                } else {
+                    zip.start_file(file.name, options).unwrap();
+                    zip.write_all(&contents).unwrap();
+                }
             } else {
                 zip.add_directory(file.name, options).unwrap();
             }
@@ -1513,7 +1604,7 @@ mod tests {
                 },
                 TimeRange::default(),
                 LogOutput {
-                    exec: Some("jq -C ."),
+                    exec: Some(JQ_COLOR),
                     ..Default::default()
                 },
                 &mut exec_out,
@@ -1531,13 +1622,261 @@ mod tests {
                 TimeRange::default(),
                 LogOutput {
                     line_ct: Some(NonZeroUsize::new(2).unwrap()),
-                    exec: Some("jq -C ."),
+                    exec: Some(JQ_COLOR),
                     ..Default::default()
                 },
                 &mut exec_head_out,
             )
             .unwrap();
         assert_snapshot!("logs_exec_head", String::from_utf8_lossy(&exec_head_out));
+    }
+
+    /// Logs compressed with zstd print the same as uncompressed ones, apart from the ".zst" on
+    /// their names.
+    #[test]
+    fn test_logs_zstd() {
+        let mut plain_buf = Vec::new();
+        let plain = Bundle::from_archive(build_zip(&mut plain_buf)).unwrap();
+
+        let mut zstd_buf = Vec::new();
+        let zstd = Bundle::from_archive(build_zip_from(&mut zstd_buf, zip_files(), true)).unwrap();
+
+        // Patterns written against the uncompressed names, as users of older bundles would have.
+        let current_log = [Pattern::new("*/current/oxide-sled-agent:default.log").unwrap()];
+        let dendrite = [Pattern::new("dendrite").unwrap()];
+        let middle = "2025-09-24T06:00:00.0Z".parse::<Timestamp>().unwrap();
+
+        let cases = [
+            (
+                LogFilter::default(),
+                TimeRange::default(),
+                LogOutput::default(),
+            ),
+            (
+                LogFilter {
+                    path: &current_log,
+                    ..Default::default()
+                },
+                TimeRange::default(),
+                LogOutput::default(),
+            ),
+            // The name timestamp is the only valid time in the oxz_switch archived log.
+            (
+                LogFilter::default(),
+                TimeRange {
+                    after: Some(middle),
+                    ..Default::default()
+                },
+                LogOutput::default(),
+            ),
+            (
+                LogFilter::default(),
+                TimeRange {
+                    before: Some(middle),
+                    ..Default::default()
+                },
+                LogOutput::default(),
+            ),
+            (
+                LogFilter::default(),
+                TimeRange::default(),
+                LogOutput {
+                    list: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                LogFilter::default(),
+                TimeRange::default(),
+                LogOutput {
+                    line_ct: Some(NonZeroUsize::new(1).unwrap()),
+                    ..Default::default()
+                },
+            ),
+            (
+                LogFilter {
+                    service: &dendrite,
+                    ..Default::default()
+                },
+                TimeRange::default(),
+                LogOutput {
+                    line_ct: Some(NonZeroUsize::new(2).unwrap()),
+                    exec: Some(JQ_COLOR),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (filter, time, output) in cases {
+            let mut plain_out = Vec::new();
+            plain.logs(filter, time, output, &mut plain_out).unwrap();
+
+            let mut zstd_out = Vec::new();
+            zstd.logs(filter, time, output, &mut zstd_out).unwrap();
+            let zstd_out = String::from_utf8(zstd_out).unwrap();
+
+            // Guard against the cases passing without reading any compressed logs.
+            assert!(zstd_out.contains(ZSTD_SUFFIX), "no .zst logs in {zstd_out}");
+            assert_eq!(
+                zstd_out.replace(ZSTD_SUFFIX, ""),
+                String::from_utf8(plain_out).unwrap(),
+                "{filter:?} {time:?} {output:?}"
+            );
+        }
+    }
+
+    /// Reading only the start of a large zstd log leaves its frame partly decoded, which must not
+    /// affect the next log decoded with the same context.
+    #[test]
+    fn test_logs_zstd_partial_read() {
+        let big_log = (0..20_000)
+            .map(|i| {
+                format!(
+                    r#"{{"msg":"line {i}","time":"2025-09-24T07:00:00Z","n":{}}}"#,
+                    i * 7919
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Place the big log ahead of the others, so that they are read after it.
+        let files = || {
+            let mut files = zip_files();
+            let first_log = files
+                .iter()
+                .position(|f| f.name.contains("/logs/") && f.contents.is_some())
+                .unwrap();
+            files.insert(
+                first_log,
+                ZipFile {
+                    name: "rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/690650fd-4f95-4b3a-b2ec-977d47154383/logs/oxz_switch/dendrite/archive/oxide-dendrite:default.log.1758700000",
+                    contents: Some(big_log.clone()),
+                    ..Default::default()
+                },
+            );
+            files
+        };
+
+        let mut plain_buf = Vec::new();
+        let plain = Bundle::from_archive(build_zip_from(&mut plain_buf, files(), false)).unwrap();
+
+        let mut zstd_buf = Vec::new();
+        let zstd = Bundle::from_archive(build_zip_from(&mut zstd_buf, files(), true)).unwrap();
+
+        let cases = [
+            (
+                TimeRange::default(),
+                LogOutput {
+                    line_ct: Some(NonZeroUsize::new(1).unwrap()),
+                    ..Default::default()
+                },
+            ),
+            (
+                TimeRange {
+                    after: Some("2025-09-24T06:00:00.0Z".parse::<Timestamp>().unwrap()),
+                    ..Default::default()
+                },
+                LogOutput::default(),
+            ),
+        ];
+
+        for (time, output) in cases {
+            let mut plain_out = Vec::new();
+            plain
+                .logs(LogFilter::default(), time, output, &mut plain_out)
+                .unwrap();
+
+            let mut zstd_out = Vec::new();
+            zstd.logs(LogFilter::default(), time, output, &mut zstd_out)
+                .unwrap();
+
+            assert_eq!(
+                String::from_utf8(zstd_out)
+                    .unwrap()
+                    .replace(ZSTD_SUFFIX, ""),
+                String::from_utf8(plain_out).unwrap(),
+                "{time:?} {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_logs_zstd_corrupt() {
+        let path = "rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/f589c739-3c4c-4731-8f6f-41c8b2e72f89/logs/global/sled-agent/current/oxide-sled-agent:default.log.zst";
+        let mut files = zip_files();
+        files.push(ZipFile {
+            name: path,
+            contents: Some("not zstd".to_string()),
+            ..Default::default()
+        });
+
+        let mut buf = Vec::new();
+        let bundle = Bundle::from_archive(build_zip_from(&mut buf, files, false)).unwrap();
+
+        let err = bundle
+            .logs(
+                LogFilter {
+                    path: &[Pattern::new(path).unwrap()],
+                    ..Default::default()
+                },
+                TimeRange::default(),
+                LogOutput::default(),
+                Vec::new(),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), format!("failed to copy file {path}"));
+    }
+
+    #[test]
+    fn test_logs_zstd_empty() {
+        let path = "rack/34261901-b550-451c-9bd0-3926bb29c40d/sled/f589c739-3c4c-4731-8f6f-41c8b2e72f89/logs/global/sled-agent/current/oxide-sled-agent:default.log.zst";
+
+        let mut buf = Vec::new();
+        let mut zip = ZipWriter::new(Cursor::new(&mut buf));
+        for file in zip_files() {
+            match file.contents {
+                Some(contents) => {
+                    zip.start_file(file.name, SimpleFileOptions::default())
+                        .unwrap();
+                    zip.write_all(contents.as_bytes()).unwrap();
+                }
+                None => zip
+                    .add_directory(file.name, SimpleFileOptions::default())
+                    .unwrap(),
+            }
+        }
+        zip.start_file(path, SimpleFileOptions::default()).unwrap();
+        zip.finish().unwrap();
+
+        let archive = ZipArchive::from_slice(&buf[..])
+            .unwrap()
+            .into_cursor_archive();
+        let bundle = Bundle::from_archive(archive).unwrap();
+
+        let filter = LogFilter {
+            path: &[Pattern::new(path).unwrap()],
+            ..Default::default()
+        };
+        let after = TimeRange {
+            after: Some("2025-09-24T06:00:00.0Z".parse::<Timestamp>().unwrap()),
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        bundle
+            .logs(filter, TimeRange::default(), LogOutput::default(), &mut out)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("==> {path} <==\n\n")
+        );
+
+        // The time check finds no timestamp in the empty contents, rather than failing to read them.
+        let mut out = Vec::new();
+        bundle
+            .logs(filter, after, LogOutput::default(), &mut out)
+            .unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
