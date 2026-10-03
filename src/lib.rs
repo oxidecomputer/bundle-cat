@@ -31,6 +31,10 @@ const JANUARY_1_2001: &Timestamp = &Timestamp::constant(978307200, 0);
 /// How much of a log file to search for a timestamp.
 const TIME_CHECK_MAX: u64 = 1 << 16;
 
+/// How much of a log file to read first when searching it for a timestamp. Most logs have one on
+/// their first line, so reading more is usually wasted.
+const TIME_CHECK_STEP: u64 = 1 << 12;
+
 /// The suffix of files compressed with zstd before being added to the bundle.
 const ZSTD_SUFFIX: &str = ".zst";
 
@@ -495,9 +499,8 @@ impl<R: ReaderAt + Sync> Bundle<R> {
         buf: &mut Vec<u8>,
         dctx: &mut DCtx<'static>,
     ) -> Result<Option<Timestamp>> {
-        buf.clear();
-        open_entry_unverified(&self.archive, log.loc, dctx)
-            .and_then(|file| Ok(file.take(TIME_CHECK_MAX).read_to_end(buf)?))
+        let contents_ts = open_entry_unverified(&self.archive, log.loc, dctx)
+            .and_then(|file| Ok(find_timestamp(file, buf)?))
             .with_context(|| format!("failed to read file {}", log.path))?;
 
         // Try several methods of finding the log's timeframe, in order of decreasing accuracy:
@@ -507,7 +510,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
         // 3. Check the file's mtime in the zip, which will be available with R17.
         // In all cases ignore times from before 2001, and skip any file where we cannot find a
         // valid time.
-        Ok(read_timestamp_from_contents(buf)
+        Ok(contents_ts
             .or_else(|| Timestamp::from_second(log.name_timestamp?).ok())
             .or(log.mtime))
     }
@@ -1011,6 +1014,40 @@ fn write_n_lines<R: Read, W: Write>(
         }
 
         writer.write_all(chunk)?;
+    }
+}
+
+/// Search the first `TIME_CHECK_MAX` bytes of `file` for a timestamp, using `buf` to hold them.
+///
+/// Read in steps that double in size, searching the complete lines from each step before reading
+/// more, so a timestamp near the start is found without reading the rest. Lines are searched in
+/// order and the final, partial line only once nothing more will be read, so this finds the same
+/// timestamp as reading everything up front.
+fn find_timestamp(mut file: impl Read, buf: &mut Vec<u8>) -> io::Result<Option<Timestamp>> {
+    buf.clear();
+    let mut searched = 0;
+    let mut step = TIME_CHECK_STEP;
+    loop {
+        let limit = step.min(TIME_CHECK_MAX - buf.len() as u64);
+        let read = (&mut file).take(limit).read_to_end(buf)?;
+        let done = (read as u64) < limit || buf.len() as u64 >= TIME_CHECK_MAX;
+
+        let end = if done {
+            buf.len()
+        } else {
+            buf[searched..]
+                .rfind_byte(b'\n')
+                .map_or(searched, |i| searched + i + 1)
+        };
+        if let Some(ts) = read_timestamp_from_contents(&buf[searched..end]) {
+            return Ok(Some(ts));
+        }
+        if done {
+            return Ok(None);
+        }
+
+        searched = end;
+        step *= 2;
     }
 }
 
@@ -2008,6 +2045,49 @@ mod tests {
         let mut out = Vec::new();
         bundle.sleds(&mut out).unwrap();
         assert_snapshot!("sleds_incomplete_bundle", String::from_utf8_lossy(&out));
+    }
+
+    /// Reading in steps finds the same timestamp as searching the whole start of the file.
+    #[test]
+    fn test_find_timestamp() {
+        let bogus = r#"{"msg":"m","time":"1986-12-26T07:30:02Z"}"#;
+        let good = r#"{"msg":"m","time":"2025-09-24T07:30:02Z"}"#;
+        let line_len = bogus.len() + 1;
+
+        let mut cases = vec![
+            String::new(),
+            good.to_string(),
+            format!("{good}\n"),
+            format!("{good}\r\n{bogus}"),
+            "not json\n".repeat(20_000),
+        ];
+        // Put a good line after bogus ones, so it starts, ends or straddles each step boundary,
+        // and at and past the end of what is searched.
+        for n in (0..=TIME_CHECK_MAX as usize / line_len + 1).step_by(7) {
+            cases.push(format!(
+                "{}{good}\n{bogus}\n",
+                format!("{bogus}\n").repeat(n)
+            ));
+        }
+        for boundary in [TIME_CHECK_STEP, 3 * TIME_CHECK_STEP, 7 * TIME_CHECK_STEP] {
+            let pad = "x".repeat(boundary as usize - 10);
+            cases.push(format!("{pad}\n{good}\n"));
+            cases.push(format!("{pad}{good}\n"));
+        }
+        let pad = "x".repeat(TIME_CHECK_MAX as usize - good.len());
+        cases.push(format!("{pad}{good}"));
+        cases.push(format!("{pad}\n{good}"));
+
+        let mut buf = Vec::new();
+        for contents in &cases {
+            let start = &contents.as_bytes()[..contents.len().min(TIME_CHECK_MAX as usize)];
+            assert_eq!(
+                find_timestamp(contents.as_bytes(), &mut buf).unwrap(),
+                read_timestamp_from_contents(start),
+                "{} bytes",
+                contents.len()
+            );
+        }
     }
 
     #[test]
