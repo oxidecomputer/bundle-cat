@@ -136,16 +136,12 @@ impl<'a> LogFile<'a> {
 
         // For logs rack/{rack_uuid}/sled/{sled_uuid}/logs/{zone}/{service}/...
         // Or for health checks rack/{rack_uuid}/sled/{sled_uuid}/{check}.json
-        let parts: Vec<_> = path.split('/').collect();
-
-        if parts.len() < 5 {
-            return None;
-        }
-
-        let sled_uuid = parts.get(3)?;
-
-        let zone = parts.get(5).copied();
-        let service = parts.get(6).copied();
+        let mut parts = path.split('/');
+        let sled_uuid = parts.nth(3)?;
+        // Only files within a sled's directory.
+        parts.next()?;
+        let zone = parts.next();
+        let service = parts.next();
 
         // Only archived logs have a trailing timestamp.
         let timestamp = Self::extract_timestamp(strip_zstd_suffix(path));
@@ -853,19 +849,28 @@ impl BundleInfo {
             }
 
             // rack/{rack_uuid}/sled/{sled_uuid}/logs/{zone}/{service}/...
-            let splits: Vec<_> = name.split('/').collect();
+            // Only the first seven parts are needed, so keep them on the stack rather than
+            // allocating for every entry.
+            let mut splits = [""; 7];
+            let mut len = 0;
+            for (i, part) in name.split('/').enumerate() {
+                if let Some(split) = splits.get_mut(i) {
+                    *split = part;
+                }
+                len = i + 1;
+            }
 
             // The zone directory itself will have a length of 7, but we want zone directories that have at least one child.
             // Empty directories may exist for zones that don't actually exist on the sled, e.g., `oxz_switch`.
-            if splits.len() == 8 {
+            if len == 8 {
                 insert_nested(&mut sled_zones, splits[3], splits[5]);
             }
 
-            if splits.len() == 9 {
+            if len == 9 {
                 insert_nested(&mut sled_services, splits[3], splits[6]);
             }
 
-            if name.ends_with("sled.txt") && splits.len() == 5 {
+            if name.ends_with("sled.txt") && len == 5 {
                 sled_txts.push((EntryLoc::new(record), name.to_string()));
             }
             Ok(())
