@@ -1,0 +1,88 @@
+#
+# Configuration for GitHub-based CI, based on the stock GitHub Rust config.
+#
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check-style:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Installs the toolchain pinned by rust-toolchain.toml.
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - name: Report rustfmt version
+        run: cargo fmt -- --version
+      - name: Check style
+        run: cargo fmt -- --check
+
+  clippy-lint:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+      - name: Report Clippy version
+        run: cargo clippy -- --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false # See Swatinem/rust-cache#341.
+      - name: Run Clippy Lints
+        run: cargo clippy --locked --all-targets -- --deny warnings
+
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    # The tests start commands and stop them partway through, which would hang rather than fail
+    # if they misbehave on a platform.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-26 for Apple silicon. Each image has jq 1.8, which the tests run.
+        os: [ubuntu-26.04, macos-26, windows-2025]
+    steps:
+      # The snapshot files must keep their LF line endings, which Git on Windows converts to
+      # CRLF by default.
+      - name: Keep LF line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # `--exec` runs commands with `$SHELL -c`, falling back to /bin/sh, which Windows lacks.
+      # Use Git's bash, whose PATH has the commands the tests run.
+      - name: Use Git's bash as the shell for --exec
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo 'SHELL=C:\Program Files\Git\bin\bash.exe' >> "$GITHUB_ENV"
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install
+      - name: Report cargo version
+        run: cargo --version
+      - name: Report rustc version
+        run: rustc --version
+      - name: Report jq version
+        run: jq --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false # See Swatinem/rust-cache#341.
+      - name: Build
+        run: cargo build --locked --all-targets --verbose
+      - name: Build the library without the CLI
+        run: cargo build --locked --no-default-features --lib --verbose
+      - name: Run tests
+        run: cargo test --locked --all-targets --verbose

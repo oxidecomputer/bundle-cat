@@ -1033,6 +1033,10 @@ mod tests {
     use std::io::Cursor;
     use std::str::FromStr;
 
+    /// Pretty-print JSON in color. `-b` keeps jq on Windows from writing CRLF line endings, and
+    /// changes nothing elsewhere.
+    const JQ_COLOR: &str = "jq -b -C .";
+
     #[derive(Default)]
     struct ZipFile {
         name: &'static str,
@@ -1600,7 +1604,7 @@ mod tests {
                 },
                 TimeRange::default(),
                 LogOutput {
-                    exec: Some("jq -C ."),
+                    exec: Some(JQ_COLOR),
                     ..Default::default()
                 },
                 &mut exec_out,
@@ -1618,7 +1622,7 @@ mod tests {
                 TimeRange::default(),
                 LogOutput {
                     line_ct: Some(NonZeroUsize::new(2).unwrap()),
-                    exec: Some("jq -C ."),
+                    exec: Some(JQ_COLOR),
                     ..Default::default()
                 },
                 &mut exec_head_out,
@@ -1697,7 +1701,7 @@ mod tests {
                 TimeRange::default(),
                 LogOutput {
                     line_ct: Some(NonZeroUsize::new(2).unwrap()),
-                    exec: Some("jq -C ."),
+                    exec: Some(JQ_COLOR),
                     ..Default::default()
                 },
             ),
