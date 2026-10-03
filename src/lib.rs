@@ -295,6 +295,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             )?;
         }
 
+        out.flush()?;
         Ok(())
     }
 
@@ -332,6 +333,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             }
         }
 
+        out.flush()?;
         Ok(())
     }
 
@@ -439,6 +441,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             }
         }
 
+        out.flush()?;
         Ok(())
     }
 
@@ -541,6 +544,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             writeln!(out, "{service}")?;
         }
 
+        out.flush()?;
         Ok(())
     }
 
@@ -603,6 +607,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             }
         }
 
+        out.flush()?;
         Ok(())
     }
 
@@ -620,6 +625,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             writeln!(out, "{zone}")?;
         }
 
+        out.flush()?;
         Ok(())
     }
 }

@@ -13,7 +13,7 @@ use jiff::{Span, Timestamp};
 use rawzip::ZipArchive;
 
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process;
@@ -22,6 +22,9 @@ use bundle_cat::{Bundle, ComponentInfo, LogFilter, LogOutput, TimeRange};
 
 /// Upper bound on the number of threads used to search logs for timestamps.
 const MAX_THREADS: NonZeroUsize = NonZeroUsize::new(6).unwrap();
+
+/// How much output to collect before writing it to standard output.
+const OUTPUT_BUFFER_SIZE: usize = 256 << 10;
 
 #[derive(Parser, Debug)]
 #[command(about = "Filter and extract logs from support bundles")]
@@ -202,6 +205,9 @@ fn run() -> Result<()> {
         .context("failed to parse sled information from bundle")?
         .with_threads(threads);
 
+    // Standard output is line buffered, which would make a system call for nearly every write.
+    let out = BufWriter::with_capacity(OUTPUT_BUFFER_SIZE, io::stdout());
+
     match &args.command {
         Commands::Ereports(EreportCmds::List(l)) => bundle.ereports_list(
             ComponentInfo {
@@ -209,7 +215,7 @@ fn run() -> Result<()> {
                 serial: &l.serial,
                 class: &l.class,
             },
-            io::stdout(),
+            out,
         ),
         Commands::Ereports(EreportCmds::Show(s)) => bundle.ereports_show(
             ComponentInfo {
@@ -218,7 +224,7 @@ fn run() -> Result<()> {
                 class: &s.class,
             },
             s.no_header,
-            io::stdout(),
+            out,
         ),
 
         Commands::Logs(l) => bundle.logs(
@@ -238,10 +244,10 @@ fn run() -> Result<()> {
                 no_header: l.no_header,
                 exec: l.exec.as_deref(),
             },
-            io::stdout(),
+            out,
         ),
-        Commands::Services(s) => bundle.services(&s.sled, io::stdout()),
-        Commands::Sleds => bundle.sleds(io::stdout()),
-        Commands::Zones(z) => bundle.zones(&z.sled, io::stdout()),
+        Commands::Services(s) => bundle.services(&s.sled, out),
+        Commands::Sleds => bundle.sleds(out),
+        Commands::Zones(z) => bundle.zones(&z.sled, out),
     }
 }
