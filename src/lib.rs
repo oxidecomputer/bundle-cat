@@ -623,8 +623,12 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             let mut dctx = DCtx::create();
             let mut file = open_entry(&self.archive, log.loc, &mut dctx)
                 .with_context(|| format!("failed to open file {}", log.path))?;
-            write_file_content(&mut file, &mut child_in, line_ct)
-                .with_context(|| format!("failed to copy file {}", log.path))
+            match write_file_content(&mut file, &mut child_in, line_ct) {
+                // The command closed its input without reading all of the file, as `head` does.
+                // As in a shell pipeline, its exit status says whether that was a failure.
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                result => result.with_context(|| format!("failed to copy file {}", log.path)),
+            }
             // Dropping `child_in` closes the command's input.
         });
 
@@ -2115,6 +2119,49 @@ mod tests {
                 .starts_with(&format!("command '{exec}' exited with")),
             "{err:#}"
         );
+    }
+
+    /// A command that exits without reading all of its input, like `head`, is not an error, and
+    /// the files after it are still run through the command.
+    #[test]
+    fn test_logs_exec_partial_input() {
+        for zstd_logs in [false, true] {
+            let mut buf = Vec::new();
+            build_zip_from(&mut buf, zip_files_with_big_log(), zstd_logs);
+            let bundle = || {
+                let archive = ZipArchive::from_slice(&buf[..])
+                    .unwrap()
+                    .into_cursor_archive();
+                Bundle::from_archive(archive).unwrap()
+            };
+            let run = |bundle: Bundle<_>, output| {
+                let mut out = Vec::new();
+                bundle
+                    .logs(LogFilter::default(), TimeRange::default(), output, &mut out)
+                    .unwrap();
+                String::from_utf8(out).unwrap()
+            };
+
+            let first_lines = run(
+                bundle(),
+                LogOutput {
+                    line_ct: Some(NonZeroUsize::MIN),
+                    ..Default::default()
+                },
+            );
+            assert!(first_lines.lines().count() > 10);
+
+            for jobs in [1, 6] {
+                let head = run(
+                    bundle().with_exec_jobs(NonZeroUsize::new(jobs).unwrap()),
+                    LogOutput {
+                        exec: Some("head -n 1"),
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(head, first_lines, "jobs: {jobs}, zstd: {zstd_logs}");
+            }
+        }
     }
 
     /// A writer that fails once `limit` bytes are written, as standard output does once the
