@@ -467,7 +467,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             .iter()
             .map(|(_, _, ereport)| ereport.ena)
             .max()
-            .map(|max| max.to_string().len())
+            .map(|max| format!("{max:#x}").len())
             .unwrap_or(3);
 
         writeln!(
@@ -487,7 +487,7 @@ impl<R: ReaderAt + Sync> Bundle<R> {
             }
             writeln!(
                 out,
-                "{:<11}\t{:<11}\t{:<36}\t{:>max_ena_len$}\t{}",
+                "{:<11}\t{:<11}\t{:<36}\t{:>#max_ena_len$x}\t{}",
                 ereport.part,
                 ereport.serial,
                 ereport.restart_id,
@@ -767,8 +767,14 @@ impl<R: ReaderAt + Sync> Bundle<R> {
     ) -> Result<Vec<(EntryLoc, String, Ereport)>> {
         let mut ereports = Vec::new();
         for_each_entry(&self.archive, |path, record| {
-            if let Some(ereport) = Ereport::from_path(path)
-                && matches_patterns(components.part, &ereport.part)
+            if !path.starts_with("ereports/") || path.ends_with('/') {
+                return Ok(());
+            }
+            let Some(ereport) = Ereport::from_path(path) else {
+                writeln!(io::stderr(), "Skipping unrecognized ereport file: {path}")?;
+                return Ok(());
+            };
+            if matches_patterns(components.part, &ereport.part)
                 && matches_patterns(components.serial, &ereport.serial)
             {
                 ereports.push((EntryLoc::new(record), path.to_string(), ereport));
@@ -1197,10 +1203,12 @@ impl Ereport {
         // Split from the right to ensure we're finding the boundary between the two.
         let (part, serial) = splits[1].rsplit_once('-')?;
         let restart_id = splits[2].to_string();
+        // Nexus names the file with the ENA in hex, e.g. `0x1.json`.
         let file_name = splits[3];
         let ena = file_name
             .strip_suffix(".json")
-            .and_then(|n| n.parse::<u64>().ok())?;
+            .and_then(|n| n.strip_prefix("0x"))
+            .and_then(|n| u64::from_str_radix(n, 16).ok())?;
 
         Some(Ereport {
             part: part.to_string(),
@@ -1361,7 +1369,7 @@ mod tests {
                 ..Default::default()
             },
             ZipFile {
-                name: "ereports/907-0000023-BRM03250000/550e8400-e29b-41d4-a716-446655440000/305419896.json",
+                name: "ereports/907-0000023-BRM03250000/550e8400-e29b-41d4-a716-446655440000/0x12345678.json",
                 contents: Some(
                     json!({
                       "restart_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -1399,7 +1407,7 @@ mod tests {
                 ..Default::default()
             },
             ZipFile {
-                name: "ereports/913-0000019-BRM09250001/660f9511-f3ac-52e5-b827-557766551111/2596069104.json",
+                name: "ereports/913-0000019-BRM09250001/660f9511-f3ac-52e5-b827-557766551111/0x9abcdef0.json",
                 contents: Some(
                     json!({
                       "restart_id": "660f9511-f3ac-52e5-b827-557766551111",
@@ -1727,6 +1735,29 @@ mod tests {
             )
             .unwrap();
         assert_snapshot!("ereport_list_by_class", String::from_utf8_lossy(&class_out));
+    }
+
+    #[test]
+    fn test_ereport_from_path() {
+        assert_eq!(
+            Ereport::from_path(
+                "ereports/913-0000003-BRM45220018/57b991f3-aecb-0c31-e854-9863d2f595fa/0x1a.json"
+            ),
+            Some(Ereport {
+                part: "913-0000003".to_string(),
+                serial: "BRM45220018".to_string(),
+                restart_id: "57b991f3-aecb-0c31-e854-9863d2f595fa".to_string(),
+                ena: 0x1a,
+            })
+        );
+
+        // The ENA is always hex, so a bare number is not one.
+        assert_eq!(
+            Ereport::from_path(
+                "ereports/913-0000003-BRM45220018/57b991f3-aecb-0c31-e854-9863d2f595fa/26.json"
+            ),
+            None
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 source: src/lib.rs
 expression: "String::from_utf8_lossy(&serial_out)"
 ---
-==> ereports/913-0000019-BRM09250001/660f9511-f3ac-52e5-b827-557766551111/2596069104.json <==
+==> ereports/913-0000019-BRM09250001/660f9511-f3ac-52e5-b827-557766551111/0x9abcdef0.json <==
 {
   "class": "ereport.cpu.amd.bus_interconnect_error",
   "collector_id": "8d4b9c01-e345-5678-90bc-def012345678",
