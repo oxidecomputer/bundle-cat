@@ -1,8 +1,8 @@
 ---
-source: bundle-cat/src/main.rs
+source: src/lib.rs
 expression: "String::from_utf8_lossy(&part_out)"
 ---
-==> ereports/907-0000023-BRM03250000/550e8400-e29b-41d4-a716-446655440000/305419896.json <==
+==> ereports/907-0000023-BRM03250000/550e8400-e29b-41d4-a716-446655440000/0x12345678.json <==
 {
   "class": "ereport.io.pci.device",
   "collector_id": "7c3a8b90-f234-4567-89ab-cdef01234567",

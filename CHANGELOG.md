@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- `ereports list` and `ereports show` find ereports in real bundles, whose
+  files are named by ENA in hex (`0x1.json`). `ereports list` prints the ENA in
+  hex, and files under `ereports/` that cannot be parsed are reported on
+  stderr rather than skipped silently.
+
 ## 0.1.0 - 2026-10-04
 
 The first release of bundle-cat, a tool to find and print files from Oxide
