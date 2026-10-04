@@ -1,0 +1,27 @@
+# Changelog
+
+All notable changes to bundle-cat are recorded in this file.
+
+The release tooling takes each release's notes from its section here, so
+release headings must keep the form `## X.Y.Z - YYYY-MM-DD`. Changes waiting
+for the next release go under `## Unreleased`, which is renamed to the new
+version's heading when it is tagged.
+
+## Unreleased
+
+The first release of bundle-cat, a tool to find and print files from Oxide
+support bundles.
+
+### Added
+
+- `sleds`, `zones` and `services` subcommands to list what a bundle holds.
+- A `logs` subcommand to print or list log files, filtered by sled (cubby,
+  serial number or UUID), service, zone, path glob and time range
+  (`--after`, `--before`). `--head` prints only the first lines of each file,
+  and `--exec` pipes each file through a shell command.
+- An `ereports` subcommand to list and show error reports, filtered by part
+  number, serial number and class.
+- Support for bundles whose logs are stored compressed with zstd, as `.zst`
+  files.
+- A `bundle-cat` library crate with the `Bundle` type, usable without the
+  command-line interface by turning off the default `cli` feature.
