@@ -1,0 +1,19 @@
+# Configuration for cargo-release. `cargo release <patch|minor|major|X.Y.Z>`
+# shows what it would do; add `--execute` to bump the version, update the
+# changelog, commit, tag and push. The pushed tag starts the dist release
+# workflow.
+
+allow-branch = ["main"]
+# Not published to crates.io yet.
+publish = false
+sign-commit = true
+sign-tag = true
+tag-name = "v{{version}}"
+tag-message = "Release {{version}}"
+pre-release-commit-message = "Release {{version}}"
+
+# Move the pending changes under the new version's heading, which dist reads
+# for the release notes, and start a new empty `Unreleased` section.
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "## Unreleased", replace = "## Unreleased\n\n## {{version}} - {{date}}", exactly = 1 },
+]
