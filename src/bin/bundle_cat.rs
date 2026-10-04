@@ -5,7 +5,8 @@
 // Copyright 2026 Oxide Computer Company
 
 use anyhow::{Context as _, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::CompleteEnv;
 use glob::Pattern;
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
@@ -178,6 +179,9 @@ pub fn parse_timestamp(relative_to: Timestamp, date_str: &str) -> Result<Timesta
 }
 
 fn main() {
+    // Generate shell completions if `COMPLETE` is set.
+    CompleteEnv::with_factory(Cli::command).complete();
+
     if let Err(e) = run() {
         if let Some(io_err) = e.downcast_ref::<io::Error>()
             && io_err.kind() == io::ErrorKind::BrokenPipe
