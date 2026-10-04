@@ -1,5 +1,5 @@
 ---
-source: bundle-cat/src/main.rs
+source: src/lib.rs
 expression: "String::from_utf8_lossy(&no_header_out)"
 ---
 {

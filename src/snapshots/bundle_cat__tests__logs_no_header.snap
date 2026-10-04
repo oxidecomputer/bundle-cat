@@ -1,5 +1,5 @@
 ---
-source: bundle-cat/src/main.rs
+source: src/lib.rs
 expression: "String::from_utf8_lossy(&no_header_out)"
 ---
 {"msg":"loopback entry fd69:644c:516f:ee88::1 already set","v":0,"name":"dpd","level":20,"time":"1986-12-26T07:30:02.0679829Z","hostname":"oxz_switch","pid":1717}
