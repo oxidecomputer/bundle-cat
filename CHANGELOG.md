@@ -1,12 +1,5 @@
 # Changelog
 
-All notable changes to bundle-cat are recorded in this file.
-
-The release tooling takes each release's notes from its section here, so
-release headings must keep the form `## X.Y.Z - YYYY-MM-DD`. Changes waiting
-for the next release go under `## Unreleased`, which is renamed to the new
-version's heading when it is tagged.
-
 ## Unreleased
 
 The first release of bundle-cat, a tool to find and print files from Oxide
