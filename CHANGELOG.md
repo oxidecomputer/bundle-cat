@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.0 - 2026-10-04
+
 The first release of bundle-cat, a tool to find and print files from Oxide
 support bundles.
 
