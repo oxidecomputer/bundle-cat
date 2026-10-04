@@ -1,7 +1,11 @@
 [package]
 name = "bundle-cat"
+description = "Find and display files in Oxide support bundles"
 version = "0.1.0"
 edition = "2024"
+license = "MPL-2.0"
+repository = "https://github.com/oxidecomputer/bundle-cat"
+readme = "README.adoc"
 
 [[bin]]
 name = "bundle-cat"
